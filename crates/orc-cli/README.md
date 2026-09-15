@@ -1,10 +1,9 @@
 # ORC
 
-Standalone command-line tool for browsing, authoring, publishing, and running ORC app packages.
+Build, publish, and manage apps from your terminal.
 
-This workspace also contains the shared [`orc-app`](../orc-app) runtime and the public
-[`orc-access`](../orc-access) client protocol. See [SPEC.md](SPEC.md) for the package
-contract and CLI specification.
+ORC is the open-source CLI for managing the apps used in [orc8r.com](https://orc8r.com).
+It supports local app workflows and distribution through OCI registries.
 
 ## Install
 
@@ -24,6 +23,20 @@ orc --version
 
 ## Quick start
 
+Replace `registry.example.com/team/my-app:1.0` with your app's OCI reference:
+
+```bash
+orc install registry.example.com/team/my-app:1.0
+orc list
+orc start my-app:1.0
+```
+
+To stop a running app, use `orc stop my-app:1.0` from another terminal. On Windows,
+foreground apps use Ctrl+C in the terminal that started them. Once stopped,
+`orc uninstall my-app:1.0` removes the app.
+
+### Use apps from orc8r.com
+
 ```bash
 echo "$TOKEN" | orc login -u you --password-stdin orc8r.com
 orc search
@@ -33,11 +46,7 @@ orc info github-runner
 orc start github-runner --github-url https://github.com/acme --github-token @token.txt
 ```
 
-## Local runtime
-
-`orc install`, `orc start`, `orc stop`, and `orc uninstall` use the shared app runtime.
-On Windows, foreground apps are stopped with Ctrl+C in the terminal that started them;
-`orc stop` from another terminal supports service-managed apps.
+## Local storage
 
 Configuration, cache, and state can be relocated independently:
 
@@ -60,13 +69,21 @@ cargo build --release -p orc-cli
 ./target/release/orc --version
 ```
 
+## orc8r.com service connections
+
+For orc8r.com users, `orc forward` and `orc proxy` provide authenticated connections
+to services through the product. See [SPEC.md](SPEC.md) for the command reference.
+
 ## Development
 
 - **CI:** pull requests and pushes to `main` run formatting, lint, build, and test checks for the public workspace.
 - **Release:** a `v*` tag builds the four CLI archives, publishes SHA-256 checksums,
   signs build-provenance attestations, and creates the GitHub Release.
 
-Changes to package runtime behavior belong in the `orc-app` crate in this repo; this crate tracks the `orc` binary and CLI UX.
+Changes to package runtime behavior belong in the `orc-app` crate in this repo;
+this crate tracks the `orc` binary and CLI UX. The `orc-access` crate supports
+orc8r.com service connections. See [SPEC.md](SPEC.md) for the package contract
+and CLI specification.
 
 ## License
 
