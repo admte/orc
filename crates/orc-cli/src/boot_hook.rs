@@ -63,7 +63,14 @@ const RUNONCE_RELATIVE: &str = "runonce/orc-install-resume.cmd";
 /// and therefore the `StateDir` holding the resume marker — is not something the boot
 /// context would derive on its own. Carrying the values the current process resolved is
 /// what makes `sudo orc install` resumable at all.
-const CARRIED_ENV: [&str; 4] = ["ORC_STATE_DIR", "ORC_CACHE_DIR", "ORC_CONFIG_DIR", "HOME"];
+const CARRIED_ENV: [&str; 6] = [
+    "ORC_STATE_DIR",
+    "ORC_CACHE_DIR",
+    "ORC_CONFIG_DIR",
+    "HOME",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+];
 
 /// What the hook re-invokes: this executable, plus the environment the resumed run needs.
 #[derive(Debug, Clone, PartialEq, Eq)]

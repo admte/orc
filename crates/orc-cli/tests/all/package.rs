@@ -953,6 +953,13 @@ async fn install_materializes_and_records_parametrized_app() {
         "start": {"service": "demo-service"}
     }"#
     .to_vec();
+    let mut config: serde_json::Value = serde_json::from_slice(&config).expect("config");
+    if cfg!(windows) {
+        config["install"]["command"] = json!(
+            r#"[IO.File]::AppendAllText((Join-Path $PWD "hook.txt"), "$env:URL $env:DEBUG $env:APP_VERSION`n")"#
+        );
+    }
+    let config = serde_json::to_vec(&config).expect("config");
     let payload = b"payload".to_vec();
     let config_digest = digest_bytes(&config);
     let payload_digest = digest_bytes(&payload);
@@ -1025,12 +1032,19 @@ async fn install_runs_script_before_recording_app() {
         "install": {"timeout": "5s"}
     }"#
     .to_vec();
-    let script = b"printf script > hook.txt\n".to_vec();
+    let (script_name, script) = if cfg!(windows) {
+        (
+            "install-demo.ps1",
+            br#"[IO.File]::WriteAllText((Join-Path $PWD "hook.txt"), "script")"#.to_vec(),
+        )
+    } else {
+        ("install-demo.sh", b"printf script > hook.txt\n".to_vec())
+    };
     let server = PullMockServer::start(single_file_app_routes(
         "acme/demo",
         "2.0",
         config,
-        "install-demo.sh",
+        script_name,
         script,
         "text/x-shellscript",
     ))
@@ -1068,14 +1082,21 @@ async fn uninstall_runs_hook_and_removes_installed_state_but_keeps_cache() {
         "uninstall": {"timeout": "5s"}
     }"#
     .to_vec();
-    let script = b"printf \"script $APP_VERSION\" > ../uninstall.txt\n".to_vec();
+    let (script_name, script) = if cfg!(windows) {
+        ("uninstall-demo.ps1", br#"[IO.File]::WriteAllText((Join-Path $PWD "../uninstall.txt"), "script $env:APP_VERSION")"#.to_vec())
+    } else {
+        (
+            "uninstall-demo.sh",
+            b"printf \"script $APP_VERSION\" > ../uninstall.txt\n".to_vec(),
+        )
+    };
     let config_digest = digest_bytes(&config);
     let script_digest = digest_bytes(&script);
     let server = PullMockServer::start(single_file_app_routes(
         "acme/demo",
         "3.0",
         config.clone(),
-        "uninstall-demo.sh",
+        script_name,
         script.clone(),
         "text/x-shellscript",
     ))
@@ -1098,7 +1119,7 @@ async fn uninstall_runs_hook_and_removes_installed_state_but_keeps_cache() {
         .expect("run install");
     assert_success(&install);
     assert_file_bytes(
-        state_dir.path().join("apps/demo/3.0/uninstall-demo.sh"),
+        state_dir.path().join("apps/demo/3.0").join(script_name),
         &script,
     );
 
@@ -1150,6 +1171,13 @@ async fn start_runs_installed_command_mode_app_foreground_and_records_completion
         "start": {"command": "printf \"out:$URL:$APP_VERSION\\n\"; printf \"$URL $APP_VERSION\" > started.txt"}
     }"#
     .to_vec();
+    let mut config: serde_json::Value = serde_json::from_slice(&config).expect("config");
+    if cfg!(windows) {
+        config["start"]["command"] = json!(
+            r#"[Console]::Write("out:${env:URL}:${env:APP_VERSION}`n"); [IO.File]::WriteAllText((Join-Path $PWD "started.txt"), "$env:URL $env:APP_VERSION")"#
+        );
+    }
+    let config = serde_json::to_vec(&config).expect("config");
     let payload = b"payload".to_vec();
     let server = PullMockServer::start(single_file_app_routes(
         "acme/demo",
@@ -1214,6 +1242,13 @@ async fn start_materializes_inline_content_param_as_file() {
         "start": {"command": "sh \"${CMD_FILE}\" > out.txt"}
     }"#
     .to_vec();
+    let mut config: serde_json::Value = serde_json::from_slice(&config).expect("config");
+    if cfg!(windows) {
+        config["start"]["command"] = json!(
+            r#"[IO.File]::WriteAllText((Join-Path $PWD "out.txt"), ((Invoke-Expression ([IO.File]::ReadAllText($env:CMD_FILE))) + "`n"))"#
+        );
+    }
+    let config = serde_json::to_vec(&config).expect("config");
     let payload = b"payload".to_vec();
     let server = PullMockServer::start(single_file_app_routes(
         "acme/demo",
@@ -1256,6 +1291,16 @@ async fn start_cold_installs_with_params_then_runs_command_mode_app() {
         "start": {"command": "printf \"started:$URL:$APP_VERSION\\n\"; printf \"$URL $APP_VERSION\" > started.txt"}
     }"#
     .to_vec();
+    let mut config: serde_json::Value = serde_json::from_slice(&config).expect("config");
+    if cfg!(windows) {
+        config["install"]["command"] = json!(
+            r#"[IO.File]::WriteAllText((Join-Path $PWD "installed.txt"), "installed:${env:URL}:${env:APP_VERSION}")"#
+        );
+        config["start"]["command"] = json!(
+            r#"[Console]::Write("started:${env:URL}:${env:APP_VERSION}`n"); [IO.File]::WriteAllText((Join-Path $PWD "started.txt"), "$env:URL $env:APP_VERSION")"#
+        );
+    }
+    let config = serde_json::to_vec(&config).expect("config");
     let payload = b"payload".to_vec();
     let server = PullMockServer::start(single_file_app_routes(
         "acme/demo",

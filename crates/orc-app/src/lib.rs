@@ -12,6 +12,7 @@ pub mod error;
 pub mod lifecycle;
 pub mod package;
 pub mod params;
+pub mod paths;
 pub mod persist;
 pub mod probe;
 pub mod process;

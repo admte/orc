@@ -137,12 +137,7 @@ fn protected_filenames(digests: &BTreeSet<String>) -> Result<BTreeSet<String>> {
 }
 
 fn cache_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("ORC_CACHE_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = std::env::var("HOME")
-        .map_err(|_| CliError::Operational("HOME is not set; cannot locate CacheDir".to_owned()))?;
-    Ok(PathBuf::from(home).join(".cache/orc"))
+    crate::paths::cache_dir()
 }
 
 fn count_blobs(dir: &Path) -> Result<(u64, u64)> {

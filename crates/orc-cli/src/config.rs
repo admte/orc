@@ -105,13 +105,7 @@ impl StoredConfig {
 ///
 /// Returns an error when neither is known.
 pub fn config_file() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("ORC_CONFIG_DIR") {
-        return Ok(PathBuf::from(dir).join("config.json"));
-    }
-    let home = std::env::var("HOME").map_err(|_| {
-        CliError::Operational("HOME is not set; cannot locate ConfigDir".to_owned())
-    })?;
-    Ok(PathBuf::from(home).join(".config/orc/config.json"))
+    Ok(orc_app::paths::config_dir()?.join("config.json"))
 }
 
 #[cfg(test)]

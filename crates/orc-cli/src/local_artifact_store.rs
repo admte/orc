@@ -78,12 +78,7 @@ pub struct CachedMaterializedPackage {
 }
 
 pub fn cache_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("ORC_CACHE_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = std::env::var("HOME")
-        .map_err(|_| CliError::Operational("HOME is not set; cannot locate CacheDir".to_owned()))?;
-    Ok(PathBuf::from(home).join(".cache/orc"))
+    orc_app::paths::cache_dir()
 }
 
 pub fn descriptor_for(media_type: &str, body: &[u8]) -> Result<CachedDescriptor> {

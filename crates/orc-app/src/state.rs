@@ -158,12 +158,7 @@ fn installs_dir() -> Result<PathBuf> {
 /// Root of the runtime state: install records, materialized app dirs, and the markers a
 /// runtime keeps between passes.
 pub fn state_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("ORC_STATE_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let home = std::env::var("HOME")
-        .map_err(|_| CliError::Operational("HOME is not set; cannot locate StateDir".to_owned()))?;
-    Ok(PathBuf::from(home).join(".local/state/orc"))
+    crate::paths::state_dir()
 }
 
 fn encode_component(value: &str) -> String {
