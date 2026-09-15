@@ -12,17 +12,13 @@ fn install_uses_cached_short_ref_without_registry() {
     std::fs::write(package.path().join("README.md"), "cached payload\n").expect("payload");
     std::fs::write(
         package.path().join("artifact.yaml"),
-        r"
-artifactType: application/vnd.orc8r.app.v1
-annotations:
-  org.opencontainers.image.title: platform-info
-config:
-  install:
-    command: |
-      printf installed > installed.txt
-files:
-  - README.md
-",
+        serde_yaml::to_string(&serde_json::json!({
+            "artifactType": "application/vnd.orc8r.app.v1",
+            "annotations": {"org.opencontainers.image.title": "platform-info"},
+            "config": {"install": {"command": install_command()}},
+            "files": ["README.md"],
+        }))
+        .expect("serialize recipe"),
     )
     .expect("recipe");
 
@@ -66,19 +62,15 @@ fn start_cold_installs_from_cached_short_ref_without_registry() {
     std::fs::write(package.path().join("README.md"), "cached payload\n").expect("payload");
     std::fs::write(
         package.path().join("artifact.yaml"),
-        r#"
-artifactType: application/vnd.orc8r.app.v1
-config:
-  install:
-    command: |
-      printf installed > installed.txt
-  start:
-    command: |
-      printf "started from cache\n"
-      printf started > started.txt
-files:
-  - README.md
-"#,
+        serde_yaml::to_string(&serde_json::json!({
+            "artifactType": "application/vnd.orc8r.app.v1",
+            "config": {
+                "install": {"command": install_command()},
+                "start": {"command": start_command()},
+            },
+            "files": ["README.md"],
+        }))
+        .expect("serialize recipe"),
     )
     .expect("recipe");
 
@@ -101,7 +93,7 @@ files:
     );
     assert_success(&start);
     assert_eq!(
-        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stdout).replace("\r\n", "\n"),
         "started from cache\n"
     );
     assert_file_text(
@@ -313,4 +305,20 @@ fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn install_command() -> &'static str {
+    if cfg!(windows) {
+        "[IO.File]::WriteAllText((Join-Path $PWD 'installed.txt'), 'installed')"
+    } else {
+        "printf installed > installed.txt"
+    }
+}
+
+fn start_command() -> &'static str {
+    if cfg!(windows) {
+        "Write-Output 'started from cache'; [IO.File]::WriteAllText((Join-Path $PWD 'started.txt'), 'started')"
+    } else {
+        "printf 'started from cache\\n'; printf started > started.txt"
+    }
 }

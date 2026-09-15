@@ -4465,10 +4465,21 @@ mod tests {
         // The directory outlives the test through the target it is handed to; the
         // fixture keeps its own copy of the path rather than the handle.
         let work_dir = work.keep();
+        let (stop, stopped) = if cfg!(windows) {
+            (
+                "[IO.File]::AppendAllText((Join-Path $PWD 'steps.txt'), \"stop`n\")",
+                "[IO.File]::AppendAllText((Join-Path $PWD 'steps.txt'), \"stopped:$env:APP_STOP_STATUS`n\")",
+            )
+        } else {
+            (
+                "printf 'stop\\n' >> steps.txt",
+                "printf \"stopped:$APP_STOP_STATUS\\n\" >> steps.txt",
+            )
+        };
         let config = app_config(serde_json::json!({
             "start": {"command": "./run.sh", "service": "demo"},
-            "stop": {"command": "printf 'stop\\n' >> steps.txt", "timeout": "10s", "grace": "5s"},
-            "stopped": {"command": "printf \"stopped:$APP_STOP_STATUS\\n\" >> steps.txt"}
+            "stop": {"command": stop, "timeout": "10s", "grace": "5s"},
+            "stopped": {"command": stopped}
         }));
         let params = std::collections::BTreeMap::new();
         let mode = run_mode("demo", "1.0", &config, &work_dir, &params)
