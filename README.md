@@ -2,9 +2,10 @@
 
 Build, publish, and manage apps from your terminal.
 
-ORC is the open-source CLI for managing the apps used in [orc8r.com](https://orc8r.com).
-Use it to package apps, distribute them through OCI registries, and run them on
-Linux, macOS, and Windows.
+ORC is a standalone, open-source CLI for managing apps on Linux, macOS, and Windows.
+Package apps, distribute them through OCI registries, and run them on your own machines.
+
+ORC also powers app workflows in [orc8r.com](https://orc8r.com).
 
 ## Manage the app lifecycle
 
