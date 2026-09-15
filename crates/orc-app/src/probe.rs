@@ -973,24 +973,25 @@ mod tests {
         .expect("the node address alone answers, which is why this looked healthy");
     }
 
-    /// The inverse, and the thing the authoring docs ask for: an app bound to the
-    /// dual-stack wildcard answers on every address it is delivered on, so a probe
-    /// that dials all of them passes.
+    /// An app answering both address families passes every delivered-address probe.
     #[tokio::test]
     async fn an_endpoint_answering_every_delivered_address_is_ready() {
-        // A host with no IPv6 at all cannot host the scenario; anywhere else this
-        // binds both families on one socket, which is what `[::]` is for.
-        let Ok(listener) = tokio::net::TcpListener::bind("[::]:0").await else {
+        // Bind loopback in each family explicitly: Windows defaults IPv6 sockets
+        // to IPv6-only, while Unix wildcard listeners may accept both families.
+        let Ok(ipv6) = tokio::net::TcpListener::bind("[::1]:0").await else {
             return;
         };
-        let port = listener.local_addr().expect("addr").port();
+        let port = ipv6.local_addr().expect("addr").port();
+        let _ipv4 = tokio::net::TcpListener::bind((FALLBACK_PROBE_HOST, port))
+            .await
+            .expect("IPv4 listener on the same port");
 
         run_probe(
             &planned(ProbeKind::Tcp { port }, Duration::from_secs(1)),
             &ctx_delivered_on(FALLBACK_PROBE_HOST, &["::1"]),
         )
         .await
-        .expect("a dual-stack listener answers on both addresses");
+        .expect("both listeners answer their delivered addresses");
     }
 
     /// An app bound to the node's routable address alone — the false negative a
