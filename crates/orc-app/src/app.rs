@@ -820,6 +820,5 @@ impl ManifestDocument {
 
 fn looks_like_index(body: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .is_some_and(|value| value.get("manifests").is_some())
+        .is_ok_and(|value| value.get("manifests").is_some())
 }
