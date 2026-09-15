@@ -50,6 +50,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild@0.20.1
+      - uses: Swatinem/rust-cache@v2
       - name: Build and package
         shell: bash
         run: |
@@ -61,6 +62,7 @@ jobs:
             arch="$2"
             cargo zigbuild --release --locked -p orc-cli --target "${triple}.2.28"
             rm -rf package/*
+            if [[ "$arch" == amd64 ]]; then "target/$triple/release/orc" --version; fi
             cp "target/$triple/release/orc" package/orc
             cp LICENSE package/LICENSE
             tar -czf "dist/orc_linux_$arch.tar.gz" -C package orc LICENSE
@@ -81,11 +83,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
       - name: Build and package
         shell: bash
         run: |
           set -euo pipefail
           cargo build --release --locked -p orc-cli --target aarch64-apple-darwin
+          target/aarch64-apple-darwin/release/orc --version
           mkdir -p dist package
           cp target/aarch64-apple-darwin/release/orc package/orc
           cp LICENSE package/LICENSE
@@ -104,11 +108,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
       - name: Build and package
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           cargo build --release --locked -p orc-cli
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & target/release/orc.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force -Path dist, package | Out-Null
           Copy-Item target/release/orc.exe package/orc.exe
