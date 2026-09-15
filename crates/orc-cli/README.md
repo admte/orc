@@ -33,6 +33,22 @@ orc info github-runner
 orc start github-runner --github-url https://github.com/acme --github-token @token.txt
 ```
 
+## Local runtime
+
+`orc install`, `orc start`, `orc stop`, and `orc uninstall` use the shared app runtime.
+On Windows, foreground apps are stopped with Ctrl+C in the terminal that started them;
+`orc stop` from another terminal supports service-managed apps.
+
+Configuration, cache, and state can be relocated independently:
+
+| Override | Linux / macOS default | Windows default |
+| --- | --- | --- |
+| `ORC_CONFIG_DIR` | `$HOME/.config/orc` | `%LOCALAPPDATA%/orc/config` |
+| `ORC_CACHE_DIR` | `$HOME/.cache/orc` | `%LOCALAPPDATA%/orc/cache` |
+| `ORC_STATE_DIR` | `$HOME/.local/state/orc` | `%LOCALAPPDATA%/orc/state` |
+
+If `LOCALAPPDATA` is absent, Windows uses `%USERPROFILE%/AppData/Local` as its base.
+
 ## Build from source
 
 Requires Rust 1.88+ (see the repository root `rust-toolchain.toml`):

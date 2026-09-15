@@ -1,6 +1,6 @@
 [package]
 name = "orc-access"
-version = "0.5.0-rc2"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Public ORC service-access protocol"
