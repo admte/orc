@@ -121,7 +121,7 @@ pub fn is_valid_tag(tag: &str) -> bool {
 
 fn split_prefix(prefix: &str) -> Result<(&str, &str)> {
     let prefix = prefix.trim().trim_end_matches('/');
-    let (registry, namespace) = prefix.split_once('/').map_or((prefix, ""), |parts| parts);
+    let (registry, namespace) = prefix.split_once('/').unwrap_or((prefix, ""));
     validate_path(registry, "registry")?;
     if !namespace.is_empty() {
         validate_path(namespace, "namespace")?;

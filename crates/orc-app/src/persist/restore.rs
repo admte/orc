@@ -996,9 +996,7 @@ fn create_in_place(
         .ok_or_else(|| RestoreError::BadParent(relative.to_owned()))?
         .to_path_buf();
     if !verified.contains(&parent) {
-        let real = std::fs::symlink_metadata(&parent)
-            .ok()
-            .is_some_and(|meta| meta.is_dir());
+        let real = std::fs::symlink_metadata(&parent).is_ok_and(|meta| meta.is_dir());
         if !real {
             return Err(RestoreError::BadParent(relative.to_owned()));
         }
