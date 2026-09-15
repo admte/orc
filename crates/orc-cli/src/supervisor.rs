@@ -143,9 +143,33 @@ pub fn alive(pid: u32) -> bool {
     probe == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Windows has no supervisor signalling, so nothing here asks a process anything; the
-/// pid is reported as present and the caller refuses the live stop.
-#[cfg(not(unix))]
+/// Query the process handle without signalling or waiting. A terminated process may
+/// still have a handle, so opening it alone does not establish liveness. If access is
+/// denied, conservatively retain the record just as the Unix probe does for `EPERM`.
+#[cfg(windows)]
+#[must_use]
+pub fn alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    // SAFETY: OpenProcess accepts scalar arguments and returns an owned handle or null.
+    // Only a successful handle is passed to the zero-timeout wait, then closed once.
+    #[allow(unsafe_code)]
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return std::io::Error::last_os_error().raw_os_error()
+                != i32::try_from(ERROR_INVALID_PARAMETER).ok();
+        }
+        let status = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        status != WAIT_OBJECT_0
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 #[must_use]
 pub fn alive(_pid: u32) -> bool {
     true
