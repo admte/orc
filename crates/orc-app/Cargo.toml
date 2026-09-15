@@ -1,0 +1,61 @@
+[package]
+name = "orc-app"
+version = "0.5.0-rc1"
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared ORC app runtime: OCI package contract, blob cache, install state, and lifecycle phases"
+license = "MIT"
+repository = "https://github.com/admte/orc"
+publish = false
+
+[dependencies]
+aes-gcm = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+fastcdc = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
+globset = { workspace = true }
+infer = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+tokio-util = { workspace = true, features = ["io-util"] }
+tracing = { workspace = true }
+x509-parser = "0.16"
+zstd = { workspace = true }
+
+# The service backends. systemd reports unit state over D-Bus and nothing else; the
+# Windows SCM has its own API, and `windows-sys` carries the one notification call the
+# `windows-service` crate does not wrap.
+[target."cfg(target_os = \"linux\")".dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+[target."cfg(windows)".dependencies]
+windows-service = "0.7"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+axum = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tempfile = { workspace = true }
+time = "0.3"
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls = { workspace = true }
+
+[lints]
+workspace = true

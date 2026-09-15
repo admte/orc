@@ -1,0 +1,168 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  validate:
+    name: Validate release version
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Match crate versions to the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for manifest in crates/orc-access/Cargo.toml crates/orc-app/Cargo.toml crates/orc-cli/Cargo.toml; do
+            actual="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$manifest")"
+            if [[ "$actual" != "$version" ]]; then
+              echo "$manifest has version $actual; tag names $version" >&2
+              exit 1
+            fi
+          done
+
+  linux:
+    name: Linux amd64 and arm64
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.20.1
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist package
+          for pair in "x86_64-unknown-linux-gnu amd64" "aarch64-unknown-linux-gnu arm64"; do
+            set -- $pair
+            triple="$1"
+            arch="$2"
+            cargo zigbuild --release --locked -p orc-cli --target "${triple}.2.28"
+            rm -rf package/*
+            cp "target/$triple/release/orc" package/orc
+            cp LICENSE package/LICENSE
+            tar -czf "dist/orc_linux_$arch.tar.gz" -C package orc LICENSE
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orc-linux
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    name: macOS arm64
+    needs: validate
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p orc-cli --target aarch64-apple-darwin
+          mkdir -p dist package
+          cp target/aarch64-apple-darwin/release/orc package/orc
+          cp LICENSE package/LICENSE
+          tar -czf dist/orc_darwin_arm64.tar.gz -C package orc LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orc-macos
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    name: Windows amd64
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Build and package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --locked -p orc-cli
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path dist, package | Out-Null
+          Copy-Item target/release/orc.exe package/orc.exe
+          Copy-Item LICENSE package/LICENSE
+          Compress-Archive -Path package/* -DestinationPath dist/orc_windows_amd64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orc-windows
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check release inventory and write checksums
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          expected=(
+            orc_darwin_arm64.tar.gz
+            orc_linux_amd64.tar.gz
+            orc_linux_arm64.tar.gz
+            orc_windows_amd64.zip
+          )
+          for asset in "${expected[@]}"; do
+            test -f "$asset" || { echo "missing release asset: $asset" >&2; exit 1; }
+          done
+          sha256sum "${expected[@]}" > SHA256SUMS
+      - name: Sign build provenance
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Create release and upload assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          prerelease=()
+          [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+            --generate-notes "${prerelease[@]}"
+          gh release upload "$GITHUB_REF_NAME" dist/*

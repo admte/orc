@@ -1,0 +1,57 @@
+[package]
+name = "orc-cli"
+version = "0.5.0-rc1"
+edition.workspace = true
+rust-version.workspace = true
+description = "Standalone ORC app package command-line tool"
+license = "MIT"
+repository = "https://github.com/admte/orc"
+publish = false
+build = "build.rs"
+autoexamples = false
+
+[lib]
+name = "orc_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "orc"
+path = "src/main.rs"
+
+[dependencies]
+bytes = { workspace = true }
+clap = { workspace = true }
+console = { workspace = true }
+futures-util = { workspace = true }
+indicatif = { workspace = true }
+infer = { workspace = true }
+http = { workspace = true }
+orc-app = { path = "../orc-app" }
+orc-access = { path = "../orc-access" }
+reqwest = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[lints]
+workspace = true

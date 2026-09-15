@@ -1,0 +1,38 @@
+artifactType: application/vnd.orc8r.app.v1
+
+annotations:
+  org.opencontainers.image.title: platform-info
+  org.opencontainers.image.description: Tiny ORC example app with shared and per-platform payloads
+
+config:
+  default_version: "1.0.0"
+  start:
+    command:
+      - "./bin/platform-info-{os}-{arch}"
+      - "--message"
+      - "{message}"
+
+files:
+  - README.md
+  - config/default.env
+  - path: "bin/platform-info-{os}-{arch}"
+    sha256: "{sha256}"
+
+platforms:
+  - os: linux
+    arch: amd64
+    vars:
+      message: "hello from linux amd64"
+      sha256: "62ed6b7da52bb5871d6e05ffe3b878bd74772a3057df12ddf09a50793d44ff09"
+
+  - os: linux
+    arch: arm64
+    vars:
+      message: "hello from linux arm64"
+      sha256: "c60fc2611f99bf7b83f930ca4cc8a1c17075e3cb97f680ea8ff4b5e3b7dbfe78"
+
+  - os: darwin
+    arch: arm64
+    vars:
+      message: "hello from darwin arm64"
+      sha256: "8e905a737399a5ed287e8b1f9e99945e90f043397df06fff30f3df2b1398fdc9"

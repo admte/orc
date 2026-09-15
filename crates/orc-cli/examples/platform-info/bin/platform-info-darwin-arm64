@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+echo "platform-info"
+echo "platform: darwin/arm64"
+echo "args: $*"
+echo "default env:"
+cat config/default.env

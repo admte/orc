@@ -1,0 +1,27 @@
+[package]
+name = "orc-access"
+version = "0.5.0-rc1"
+edition.workspace = true
+rust-version.workspace = true
+description = "Public ORC service-access protocol"
+license = "MIT"
+repository = "https://github.com/admte/orc"
+publish = false
+build = "build.rs"
+
+[dependencies]
+bytes = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio-stream = { workspace = true }
+
+[lints]
+workspace = true

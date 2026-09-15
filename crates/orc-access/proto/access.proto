@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package orc.access.v1;
+
+// Public service for forwarding TCP or UDP connections through an ORC server.
+// A client opens a session, authorizes its targets, then opens one Forward stream
+// for each connection. Every RPC uses the same authenticated HTTP/2 connection
+// and carries the user's bearer credential.
+service AccessService {
+  // Returns server naming and the limits that apply to access sessions.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+  // Opens a session and keeps it alive for the lifetime of the response stream.
+  rpc OpenSession(OpenSessionRequest) returns (stream SessionEvent);
+  // Adds one target to an existing session.
+  rpc AuthorizeTarget(AuthorizeTargetRequest) returns (ResolvedTarget);
+  // Carries one forwarded connection in each direction.
+  rpc Forward(stream ForwardFrame) returns (stream ForwardFrame);
+}
+
+message DescribeRequest {
+  // Organization code or identifier. Empty lets the server infer it when the
+  // authenticated user belongs to exactly one organization.
+  string org = 1;
+}
+
+message DescribeResponse {
+  // Organization selected for this access session.
+  string org_code = 1;
+  string org_name = 2;
+  // Internal service-name suffix advertised by this server.
+  string internal_dns_suffix = 3;
+  // Session and connection limits, in seconds or counts as named.
+  uint64 idle_timeout_secs = 4;
+  uint64 max_session_lifetime_secs = 5;
+  uint64 break_glass_max_lifetime_secs = 6;
+  uint32 max_sessions_per_user = 7;
+  uint32 max_tunnels_per_agent = 8;
+  // Server version included in client diagnostics.
+  string server_version = 9;
+  uint32 max_targets_per_session = 10;
+}
+
+message OpenSessionRequest {
+  string org = 1;
+  // Initial authorized targets. May be empty for clients that discover targets
+  // incrementally and call AuthorizeTarget later.
+  repeated ForwardTarget targets = 2;
+  // Allows the session to request node targets and applies the shorter
+  // break-glass lifetime reported by Describe.
+  bool break_glass = 3;
+}
+
+message AuthorizeTargetRequest {
+  string session_id = 1;
+  ForwardTarget target = 2;
+}
+
+message ForwardTarget {
+  TunnelKind kind = 1;
+  oneof target {
+    // A declared endpoint of a project pool.
+    ServiceTarget service = 2;
+    // A host and port reached through one named node.
+    NodeTarget node = 3;
+  }
+}
+
+message ServiceTarget {
+  string project = 1;
+  string pool = 2;
+  // Declared endpoint name. Empty selects by port.
+  string endpoint = 3;
+  // Zero uses the declared endpoint's port and therefore requires endpoint.
+  uint32 port = 4;
+  // Zero lets the service choose a pool member; nonzero pins a slot.
+  uint32 slot = 5;
+}
+
+message NodeTarget {
+  string node = 1;
+  string host = 2;
+  uint32 port = 3;
+}
+
+enum TunnelKind {
+  TUNNEL_KIND_UNSPECIFIED = 0;
+  // Data frames form one ordered byte stream.
+  TUNNEL_KIND_TCP = 1;
+  // Each data frame is one datagram.
+  TUNNEL_KIND_UDP = 2;
+}
+
+message SessionEvent {
+  oneof kind {
+    // First event after a session is accepted.
+    SessionOpened opened = 1;
+    // Final event when the session ends.
+    SessionClosed closed = 2;
+  }
+}
+
+message SessionOpened {
+  string session_id = 1;
+  repeated ResolvedTarget targets = 2;
+  uint64 lifetime_secs = 3;
+  uint64 idle_timeout_secs = 4;
+}
+
+message ResolvedTarget {
+  // Canonical target text suitable for client output.
+  string display = 1;
+  // Declared endpoint name; empty for node targets.
+  string endpoint = 2;
+  // Resolved destination port.
+  uint32 port = 3;
+  // Permission that admitted this target.
+  string permission = 4;
+  // Fixed terminating node for a node target; empty for service targets.
+  string node = 5;
+}
+
+message SessionClosed {
+  string reason = 1;
+}
+
+message ForwardFrame {
+  oneof kind {
+    // Client to server; required as the first frame.
+    ForwardOpen open = 1;
+    // Server to client; confirms that the connection is ready.
+    ForwardReady ready = 2;
+    // Ordered bytes for TCP or exactly one datagram for UDP.
+    bytes data = 3;
+    // Either side ends its half of the connection.
+    ForwardClose close = 4;
+  }
+}
+
+message ForwardOpen {
+  string session_id = 1;
+  ForwardTarget target = 2;
+}
+
+message ForwardReady {
+  // Node and address that terminate this connection.
+  string node = 1;
+  string address = 2;
+  // Serving pool slot; zero for node targets.
+  uint32 slot = 3;
+  string permission = 4;
+  // Opaque identifier included in diagnostics for this tunnel.
+  string tunnel_id = 5;
+}
+
+message ForwardClose {
+  string reason = 1;
+  uint64 bytes_in = 2;
+  uint64 bytes_out = 3;
+}
