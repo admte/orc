@@ -742,7 +742,7 @@ fn validate_params(value: &Value) -> Result<()> {
     let object = params
         .as_object()
         .ok_or_else(|| CliError::Usage("params must be an object".to_owned()))?;
-    let allowed_top = BTreeSet::from(["type", "properties", "required"]);
+    let allowed_top = BTreeSet::from(["type", "properties", "required", "x-ui-order"]);
     for key in object.keys() {
         if !allowed_top.contains(key.as_str()) {
             return Err(CliError::Usage(format!(
@@ -774,6 +774,23 @@ fn validate_params(value: &Value) -> Result<()> {
             }
         }
     }
+    if let Some(order) = params.get("x-ui-order") {
+        let order = order
+            .as_array()
+            .ok_or_else(|| CliError::Usage("params.x-ui-order must be an array".to_owned()))?;
+        for name in order {
+            let Some(name) = name.as_str() else {
+                return Err(CliError::Usage(
+                    "params.x-ui-order entries must be strings".to_owned(),
+                ));
+            };
+            if !properties.contains_key(name) {
+                return Err(CliError::Usage(format!(
+                    "params.x-ui-order entry {name:?} has no property"
+                )));
+            }
+        }
+    }
     let allowed_property = BTreeSet::from([
         "type",
         "title",
@@ -783,6 +800,7 @@ fn validate_params(value: &Value) -> Result<()> {
         "contentMediaType",
         "sensitive",
         "placeholder",
+        "lifetime",
         "x-source",
     ]);
     for (name, property) in properties {
@@ -804,6 +822,13 @@ fn validate_params(value: &Value) -> Result<()> {
         if !matches!(kind, "string" | "boolean" | "integer" | "number") {
             return Err(CliError::Usage(format!(
                 "params property {name:?} has unsupported type {kind:?}"
+            )));
+        }
+        if let Some(lifetime) = property.get("lifetime")
+            && !matches!(lifetime.as_str(), Some("startup" | "runtime"))
+        {
+            return Err(CliError::Usage(format!(
+                "params property {name:?} lifetime must be \"startup\" or \"runtime\""
             )));
         }
         if let Some(x_source) = property.get("x-source") {
@@ -1221,6 +1246,61 @@ mod tests {
         )
         .expect("config");
         plan_directory_push(dir.path()).expect("valid x-source");
+    }
+
+    #[test]
+    fn params_schema_accepts_ui_order_and_lifetime() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join("app.config.v1.json"),
+            r#"{"params":{"type":"object","required":["url","token"],"x-ui-order":["url","token"],"properties":{"url":{"type":"string"},"token":{"type":"string","sensitive":true,"lifetime":"runtime"},"pool":{"type":"string","x-source":{"kind":"pool.name"}}}}}"#,
+        )
+        .expect("config");
+        plan_directory_push(dir.path()).expect("valid x-ui-order and lifetime");
+    }
+
+    #[test]
+    fn params_schema_rejects_malformed_ui_order_and_lifetime() {
+        let cases = [
+            (
+                "x-ui-order that is not an array",
+                r#"{"params":{"type":"object","x-ui-order":"url","properties":{"url":{"type":"string"}}}}"#,
+                "params.x-ui-order must be an array",
+            ),
+            (
+                "x-ui-order with a non-string entry",
+                r#"{"params":{"type":"object","x-ui-order":[1],"properties":{"url":{"type":"string"}}}}"#,
+                "params.x-ui-order entries must be strings",
+            ),
+            (
+                "x-ui-order naming a property that does not exist",
+                r#"{"params":{"type":"object","x-ui-order":["token"],"properties":{"url":{"type":"string"}}}}"#,
+                "params.x-ui-order entry \"token\" has no property",
+            ),
+            (
+                "x-ui-order on a property rather than the schema",
+                r#"{"params":{"type":"object","properties":{"url":{"type":"string","x-ui-order":[]}}}}"#,
+                "keyword \"x-ui-order\" is not supported",
+            ),
+            (
+                "lifetime outside the two known values",
+                r#"{"params":{"type":"object","properties":{"token":{"type":"string","lifetime":"forever"}}}}"#,
+                "lifetime must be \"startup\" or \"runtime\"",
+            ),
+            (
+                "lifetime that is not a string",
+                r#"{"params":{"type":"object","properties":{"token":{"type":"string","lifetime":true}}}}"#,
+                "lifetime must be \"startup\" or \"runtime\"",
+            ),
+        ];
+        for (case, config, expected) in cases {
+            let err = validate_app_config(config.as_bytes()).expect_err(case);
+            let message = err.to_string();
+            assert!(
+                message.contains(expected),
+                "{case}: expected {expected:?} in {message:?}"
+            );
+        }
     }
 
     #[test]
