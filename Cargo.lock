@@ -1387,7 +1387,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orc-access"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "orc-app"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "orc-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "axum",
