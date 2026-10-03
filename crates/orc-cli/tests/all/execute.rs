@@ -208,8 +208,8 @@ async fn sh_restores_the_local_terminal_after_remote_exit() {
                 &raw mut master,
                 &raw mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null()
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
             ),
             0
         );
