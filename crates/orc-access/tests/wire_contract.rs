@@ -40,6 +40,15 @@ struct DummyAccessService;
 #[async_trait::async_trait]
 impl orc_access::access_service_server::AccessService for DummyAccessService {
     type OpenSessionStream = tokio_stream::Empty<Result<orc_access::SessionEvent, tonic::Status>>;
+    type ExecuteStream = tokio_stream::Empty<Result<orc_access::ExecuteFrame, tonic::Status>>;
+
+    async fn execute(
+        &self,
+        _request: tonic::Request<tonic::Streaming<orc_access::ExecuteFrame>>,
+    ) -> Result<tonic::Response<Self::ExecuteStream>, tonic::Status> {
+        unimplemented!()
+    }
+
     type ForwardStream = tokio_stream::Empty<Result<orc_access::ForwardFrame, tonic::Status>>;
 
     async fn describe(

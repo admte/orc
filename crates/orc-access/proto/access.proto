@@ -2,9 +2,10 @@ syntax = "proto3";
 
 package orc.access.v1;
 
-// Public service for forwarding TCP or UDP connections through an ORC server.
+// Public service for forwarding connections and executing processes through an ORC server.
 // A client opens a session, authorizes its targets, then opens one Forward stream
-// for each connection. Every RPC uses the same authenticated HTTP/2 connection
+// for each connection, or an Execute stream for a process on a node.
+// Every RPC uses the same authenticated HTTP/2 connection
 // and carries the user's bearer credential.
 service AccessService {
   // Returns server naming and the limits that apply to access sessions.
@@ -15,6 +16,8 @@ service AccessService {
   rpc AuthorizeTarget(AuthorizeTargetRequest) returns (ResolvedTarget);
   // Carries one forwarded connection in each direction.
   rpc Forward(stream ForwardFrame) returns (stream ForwardFrame);
+  // Execute one process on a node, under an existing access session.
+  rpc Execute(stream ExecuteFrame) returns (stream ExecuteFrame);
 }
 
 message DescribeRequest {
@@ -156,4 +159,36 @@ message ForwardClose {
   string reason = 1;
   uint64 bytes_in = 2;
   uint64 bytes_out = 3;
+}
+
+// Ordered execution frames. Output is fully drained before exit. A lost stream
+// cancels the process; execution is never automatically retried.
+message ExecuteFrame {
+  oneof kind {
+    ExecuteOpen open = 1;
+    bytes stdin = 2;
+    bool stdin_eof = 3;
+    ExecuteSize resize = 4;
+    // INT interrupts; TERM ends the process.
+    string signal = 5;
+    bool ready = 6;
+    bytes stdout = 7;
+    bytes stderr = 8;
+    ExecuteExit exit = 9;
+  }
+}
+message ExecuteOpen {
+  string session_id = 1;
+  string node = 2;
+  // Exact argv; empty selects the default shell and requires tty + stdin.
+  repeated string command = 3;
+  bool tty = 4;
+  bool stdin = 5;
+  uint32 cols = 6;
+  uint32 rows = 7;
+}
+message ExecuteSize { uint32 cols = 1; uint32 rows = 2; }
+message ExecuteExit {
+  int32 code = 1;
+  string signal = 2;
 }

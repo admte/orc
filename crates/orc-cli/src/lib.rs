@@ -2,6 +2,7 @@ mod boot_hook;
 mod build_recipe;
 mod cli;
 pub mod config;
+mod execute;
 pub mod forward;
 mod github;
 mod info;
@@ -47,7 +48,7 @@ pub fn main_entry() -> i32 {
     };
 
     match runtime.block_on(cli::run(std::env::args_os())) {
-        Ok(()) => ExitCode::Success as i32,
+        Ok(code) => code,
         Err(err) => {
             eprintln!("{err}");
             err.exit_code() as i32
