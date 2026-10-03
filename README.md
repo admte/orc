@@ -270,6 +270,15 @@ These features are planned and are not available in the current release.
 
 orc CLI also powers app workflows in [orc8r.com](https://orc8r.com). You can use the CLI on its own with local packages and your own registry; an ORC8R account is only needed for the product's account-based features.
 
+## Remote node access
+
+On ORC8R-managed nodes, `orc sh NODE` opens the default interactive shell.
+`orc exec NODE -- COMMAND [ARG...]` runs a command and returns its exit code;
+add `-it` for an interactive terminal or `-i` to pipe input. Linux and Windows
+use the same authenticated access transport as `orc forward` and `orc proxy`.
+See [remote shells and commands](crates/orc-cli/README.md#remote-shells-and-commands)
+for examples and permissions.
+
 ## Build from source
 
 The repository pins its Rust toolchain in [`rust-toolchain.toml`](https://github.com/admte/orc/blob/main/rust-toolchain.toml).

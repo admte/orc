@@ -101,6 +101,11 @@ enum Command {
     Config(ConfigArgs),
     /// Forward a local port to a service through the ORC access service.
     Forward(crate::forward::ForwardArgs),
+    /// Open the default interactive shell on a remote node.
+    #[command(name = "sh")]
+    Sh(crate::execute::NodeArgs),
+    /// Execute a command on a remote node.
+    Exec(crate::execute::ExecArgs),
     /// Serve a SOCKS5 proxy onto one project's services, resolving every name
     /// through the ORC access service instead of a local port per service.
     Proxy(crate::proxy::ProxyArgs),
@@ -360,7 +365,7 @@ enum ConfigCommand {
 ///
 /// Returns a [`CliError`] when argument parsing, configuration loading, registry access,
 /// or command execution fails.
-pub async fn run<I, T>(args: I) -> Result<()>
+pub async fn run<I, T>(args: I) -> Result<i32>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -369,7 +374,7 @@ where
     // Per-app dynamic help: `orc start|install <app> --help` lists the app's parameters,
     // which clap can't know statically. Intercept before clap parses the help flag.
     if let Some((command, app)) = app_help_request(&raw) {
-        return print_app_help_for(&command, &app).await;
+        return print_app_help_for(&command, &app).await.map(|()| 0);
     }
     let cli = match Cli::try_parse_from(raw.iter()) {
         Ok(cli) => cli,
@@ -385,7 +390,7 @@ where
                     | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
             ) {
                 print!("{err}");
-                return Ok(());
+                return Ok(0);
             }
             return Err(CliError::Usage(err.to_string()));
         }
@@ -400,7 +405,8 @@ where
             &args.instance,
             &args.version,
         )
-        .await;
+        .await
+        .map(|()| 0);
     }
     let mut config = StoredConfig::load()?;
     let settings = CliSettings {
@@ -411,6 +417,8 @@ where
     };
 
     match cli.command {
+        Command::Sh(args) => return crate::execute::shell(args, &config).await,
+        Command::Exec(args) => return crate::execute::execute(args, &config).await,
         Command::Login(args) => login(args, &settings, &mut config).await,
         Command::Logout(args) => logout(&args, &mut config),
         Command::List(args) => list(&args, &settings),
@@ -437,6 +445,7 @@ where
             Ok(())
         }
     }
+    .map(|()| 0)
 }
 
 struct CliSettings {

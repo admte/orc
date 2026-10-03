@@ -22,3 +22,6 @@ mod reboot_shim;
 mod resume;
 #[path = "all/status.rs"]
 mod status;
+
+#[path = "all/execute.rs"]
+mod execute;

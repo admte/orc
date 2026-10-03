@@ -74,6 +74,39 @@ cargo build --release -p orc-cli
 For orc8r.com users, `orc forward` and `orc proxy` provide authenticated connections
 to services through the product. See [SPEC.md](SPEC.md) for the command reference.
 
+## Remote shells and commands
+
+Use the same `orc login` credentials, `--server` and `--org` options as forwarding:
+
+```sh
+orc sh n_d000000000001
+orc exec n_d000000000001 -- whoami
+orc exec -it n_d000000000001 -- bash
+orc exec -it n_d000000000001 -- powershell.exe
+cat script.sh | orc exec -i n_d000000000001 -- sh
+```
+
+`sh` opens the node's default interactive shell, including on Windows. `exec`
+requires an executable after `--`; `-i/--stdin` forwards input and `-t/--tty`
+allocates a terminal. `--interactive` is an alias for `--stdin`. Without `-i`,
+non-TTY processes receive EOF on stdin. Arguments retain their boundaries;
+use an explicit shell for expressions (`sh -c 'pwd && ls'` or
+`powershell.exe -Command 'Get-Service'`).
+
+Without a TTY, stdout and stderr remain separate and binary-safe. The remote
+process's exit code becomes the CLI exit code. With a TTY, output is combined,
+resizes are forwarded, and Ctrl-C interrupts the remote command. Closing the
+connection cancels execution; commands are never automatically retried. Unix
+process groups and Windows jobs clean up child processes. For non-TTY Windows
+processes, interruption terminates the job because an agent service has no
+interactive console to receive Ctrl-C.
+
+Processes run as the node agent's account and require the existing terminal
+permission. Connections use the authenticated HTTP/2 access service and routed
+agent tunnels, with forwarding's session and tunnel limits. No SSH daemon is
+required. The CLI, server and agent must support the execution protocol; older
+peers refuse it rather than falling back to shell-command emulation.
+
 ## Development
 
 - **CI:** pull requests and pushes to `main` run formatting, lint, build, and test checks for the public workspace.
