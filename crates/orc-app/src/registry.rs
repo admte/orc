@@ -842,7 +842,7 @@ impl RegistryClient {
                 // by re-POSTing the recipe for a fresh, smaller missing set — which the
                 // registry answers with this very session when it is still holding it.
                 Err(ChunkedResume::Retry) => {}
-                Err(ChunkedResume::Fatal(err)) => {
+                Err(ChunkedResume::Dropped(err) | ChunkedResume::Fatal(err)) => {
                     outcome = Err(err);
                     break;
                 }
@@ -944,14 +944,13 @@ impl RegistryClient {
     ) -> std::result::Result<(), ChunkedResume> {
         let path = format!("/v2/{repository}/_orc/chunked-uploads/{session}");
         let response = self
-            .execute(
+            .execute_classified(
                 Method::PATCH,
                 &self.url_for_path(&path),
                 &[("content-type", "application/octet-stream")],
                 Some(&body),
             )
-            .await
-            .map_err(ChunkedResume::Fatal)?;
+            .await?;
         match response.status() {
             reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::NO_CONTENT => Ok(()),
             reqwest::StatusCode::NOT_FOUND => Err(ChunkedResume::Retry),
@@ -970,9 +969,8 @@ impl RegistryClient {
     ) -> std::result::Result<(), ChunkedResume> {
         let path = format!("/v2/{repository}/_orc/chunked-uploads/{session}?digest={layer_digest}");
         let response = self
-            .execute(Method::PUT, &self.url_for_path(&path), &[], None)
-            .await
-            .map_err(ChunkedResume::Fatal)?;
+            .execute_classified(Method::PUT, &self.url_for_path(&path), &[], None)
+            .await?;
         match response.status() {
             reqwest::StatusCode::CREATED | reqwest::StatusCode::OK => Ok(()),
             // Unknown session (expired/lost) → re-POST. Still-missing frames also map to
@@ -1289,6 +1287,19 @@ impl RegistryClient {
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
     ) -> Result<reqwest::Response> {
+        Ok(self.execute_classified(method, url, headers, body).await?)
+    }
+
+    /// [`execute`](Self::execute), keeping apart a request the connection failed under
+    /// ([`Failure::NoAnswer`]) from every other failure, for a caller that can retry the
+    /// one and not the other.
+    async fn execute_classified(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> std::result::Result<reqwest::Response, Failure> {
         let path = request_path(url);
         let mut auth = match self.cached_token(&method, path) {
             Some(token) => RequestAuth::Bearer(token),
@@ -1325,19 +1336,23 @@ impl RegistryClient {
                 (RequestAuth::Bearer(token), _) => request.bearer_auth(token),
                 _ => request,
             };
-            let response = request
-                .send()
-                .await
-                .map_err(|err| CliError::Operational(format!("registry {method} {path}: {err}")))?;
+            let response = request.send().await.map_err(|err| {
+                let described = CliError::Operational(format!("registry {method} {path}: {err}"));
+                if err.is_builder() {
+                    Failure::Refused(described)
+                } else {
+                    Failure::NoAnswer(described)
+                }
+            })?;
             let status = response.status();
             if status == reqwest::StatusCode::FORBIDDEN {
-                return Err(CliError::Auth(self.access_denied_message(path)));
+                return Err(CliError::Auth(self.access_denied_message(path)).into());
             }
             if status != reqwest::StatusCode::UNAUTHORIZED {
                 return Ok(response);
             }
             if retried {
-                return Err(CliError::Auth(format!("registry access denied for {path}")));
+                return Err(CliError::Auth(format!("registry access denied for {path}")).into());
             }
             retried = true;
             let bearer_credential = matches!(&self.auth, Some(RegistryCredential::Bearer { .. }));
@@ -1357,12 +1372,14 @@ impl RegistryClient {
                 _ if self.auth.is_some() => {
                     return Err(CliError::Auth(format!(
                         "registry rejected stored credentials for {path}; re-run orc login"
-                    )));
+                    ))
+                    .into());
                 }
                 _ => {
                     return Err(CliError::Auth(format!(
                         "authentication required for {path}; run orc login"
-                    )));
+                    ))
+                    .into());
                 }
             }
         }
@@ -1913,7 +1930,43 @@ async fn sessions_held(response: reqwest::Response) -> CliError {
 /// bails to the monolithic fallback.
 pub(crate) enum ChunkedResume {
     Retry,
+    /// The connection failed under the request and no answer came back. Over HTTP/1.1
+    /// this is also how a refusal the registry sent before reading a large body arrives
+    /// (an expired token on a `PATCH`): it answers and closes, and the client, still
+    /// writing, sees a broken pipe instead of the status. See [`Failure::NoAnswer`].
+    Dropped(CliError),
     Fatal(CliError),
+}
+
+/// Why [`RegistryClient::execute_classified`] did not return a response.
+pub(crate) enum Failure {
+    /// The registry answered, or a step before sending failed: what `execute` reports.
+    Refused(CliError),
+    /// `send` failed: the connection broke before an answer arrived.
+    NoAnswer(CliError),
+}
+
+impl From<CliError> for Failure {
+    fn from(err: CliError) -> Self {
+        Self::Refused(err)
+    }
+}
+
+impl From<Failure> for CliError {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Refused(err) | Failure::NoAnswer(err) => err,
+        }
+    }
+}
+
+impl From<Failure> for ChunkedResume {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Refused(err) => Self::Fatal(err),
+            Failure::NoAnswer(err) => Self::Dropped(err),
+        }
+    }
 }
 
 /// One blob chunk on the wire (a payload frame or the trailing skippable TOC frame).
@@ -2118,6 +2171,32 @@ fn is_loopback(registry: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `PATCH` the connection breaks under — here the peer reads the request head and
+    /// hangs up on the rest — comes back `Dropped`, apart from a refusal, so the uploader
+    /// can retry it on a fresh bearer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_patch_the_connection_breaks_under_is_dropped_not_fatal() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut head = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut head);
+        });
+        let client =
+            RegistryClient::with_bearer(&addr.to_string(), "tok".to_owned(), true).expect("client");
+        let result = client
+            .chunked_patch("acme/app", "session", vec![0u8; 8 * 1024 * 1024])
+            .await;
+        server.join().expect("server thread");
+        match result {
+            Err(ChunkedResume::Dropped(_)) => {}
+            Err(ChunkedResume::Fatal(err)) => panic!("classified fatal: {err}"),
+            Err(ChunkedResume::Retry) => panic!("classified as a lost session"),
+            Ok(()) => panic!("a PATCH nobody answered succeeded"),
+        }
+    }
 
     /// Registry transfers must not ride HTTP/2, where one request is capped at the
     /// server's stream window per round trip (see [`transfer_http_builder`]). The

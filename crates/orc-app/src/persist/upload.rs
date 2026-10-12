@@ -39,9 +39,16 @@
 //!
 //! The bearer for an app-data repository can be short-lived, and one credential can cover
 //! every app repository under a caller-supplied base. The uploader holds a *provider*
-//! rather than a fixed client, so an expiry in the middle of a
-//! multi-gigabyte layer re-mints and resumes at negotiation — the frame cids are
+//! rather than a fixed client and asks it before every request, so a provider that renews
+//! ahead of expiry keeps even a multi-gigabyte layer on a live token. An expiry that gets
+//! through anyway re-mints and resumes at negotiation — the frame cids are
 //! content-addressed, so nothing already uploaded is re-sent.
+//!
+//! The registry refuses a stale token on a `PATCH` before it reads the body, and over
+//! HTTP/1.1 that refusal rarely arrives as a status: the registry answers and closes, and
+//! the client, still writing, sees a broken pipe. So a `PATCH` or finalize that got no
+//! answer at all is treated as the 401 it most likely was — one re-mint, one more attempt,
+//! the session kept for it — and a second failure surfaces as it is.
 //!
 //! # Abandoning an upload
 //!
@@ -79,10 +86,13 @@
 //! layer does before it can negotiate anything at all. A caller can poll that counter
 //! and cancel only an upload that has stopped advancing.
 //!
-//! The counter is a progress signal and not an accounting of wire bytes: a
-//! re-negotiation credits the frames the registry holds a second time, and a whole-file
-//! layer's sealing pass is counted alongside the frames it later sends. Both only ever
-//! move it forward, which is the one property the watchdog reads.
+//! The counter is a progress signal and not an accounting of wire bytes: a whole-file
+//! layer's sealing pass is counted alongside the frames it later sends. Within the network
+//! ladder each layer counts once, however many times it is negotiated: a re-negotiation —
+//! a resume, or a retry on a fresh token — is answered with the frames already held,
+//! acknowledged ones included, and only what goes past the layer's best so far is credited
+//! (see [`LayerProgress`]). The counter only ever moves forward, which is the one property
+//! the watchdog reads.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -148,7 +158,9 @@ const MAX_RESUME: usize = 3;
 /// Supplies bearer credentials for an App-data repository.
 ///
 /// `refresh` means the previous credential was rejected or is about to expire; an
-/// implementation may cache credentials otherwise.
+/// implementation may cache credentials otherwise. The uploader asks before every request,
+/// so an implementation that renews a cached credential ahead of its expiry keeps a long
+/// upload from ever sending a stale one.
 #[async_trait::async_trait]
 pub trait TokenProvider: Send + Sync {
     /// A bearer authorized to push and pull the App-data repository.
@@ -247,7 +259,8 @@ pub struct Uploader {
     repository: String,
     sealer: Arc<Sealer>,
     provider: Arc<dyn TokenProvider>,
-    client: tokio::sync::Mutex<Option<RegistryClient>>,
+    /// The client built for the bearer the provider last handed out, and that bearer.
+    client: tokio::sync::Mutex<Option<(String, RegistryClient)>>,
     /// Cut by [`Uploader::cancel`]. One uploader serves one app of one capture cycle, so
     /// the token is scoped to that too: nothing re-arms it, and a cancelled uploader is
     /// spent — as is the cycle, which never goes on to another app after a cut.
@@ -344,15 +357,21 @@ impl Uploader {
         &self.repository
     }
 
-    /// The client to use, minting a fresh bearer when asked to.
+    /// The client for the provider's current bearer, minting a fresh one when asked to.
+    ///
+    /// Asked before every request rather than once per layer: the provider is what knows
+    /// when its bearer expires, and a layer can take longer than a bearer lives. A new
+    /// client is built only when the bearer changed.
     async fn client(&self, refresh: bool) -> Result<RegistryClient> {
+        let token = self.provider.bearer(refresh).await?;
         let mut cached = self.client.lock().await;
-        if !refresh && let Some(client) = cached.as_ref() {
+        if let Some((held, client)) = cached.as_ref()
+            && *held == token
+        {
             return Ok(client.clone());
         }
-        let token = self.provider.bearer(refresh).await?;
-        let client = RegistryClient::with_bearer(&self.registry, token, self.insecure)?;
-        *cached = Some(client.clone());
+        let client = RegistryClient::with_bearer(&self.registry, token.clone(), self.insecure)?;
+        *cached = Some((token, client.clone()));
         Ok(client)
     }
 
@@ -424,12 +443,18 @@ impl Uploader {
     /// Negotiates a layer whose frames are already in memory.
     async fn push_buffered(&self, layer: &SealedLayer, frames: Vec<Vec<u8>>) -> Result<LayerRef> {
         let recipe = recipe_bytes(layer)?;
+        let mut tally = LayerProgress::default();
         for attempt in 0..2 {
-            let client = self.client(attempt > 0).await?;
-            let result = self.buffered_ladder(&client, layer, &frames, &recipe).await;
-            match result {
-                Err(CliError::Auth(_)) if attempt == 0 => {}
-                other => return other.map(|()| layer_ref(layer)),
+            if attempt > 0 {
+                self.client(true).await?;
+            }
+            match self
+                .buffered_ladder(layer, &frames, &recipe, &mut tally)
+                .await
+            {
+                Ok(()) => return Ok(layer_ref(layer)),
+                Err(AttemptError::Retry(_)) if attempt == 0 => {}
+                Err(err) => return Err(err.into()),
             }
         }
         Err(CliError::Auth(format!(
@@ -440,33 +465,30 @@ impl Uploader {
 
     async fn buffered_ladder(
         &self,
-        client: &RegistryClient,
         layer: &SealedLayer,
         frames: &[Vec<u8>],
         recipe: &[u8],
-    ) -> Result<()> {
+        tally: &mut LayerProgress,
+    ) -> Attempt {
         let mut open = OpenSession::default();
         let result = self
-            .buffered_walk(client, layer, frames, recipe, &mut open)
+            .buffered_walk(layer, frames, recipe, &mut open, tally)
             .await;
-        self.close_out(client, open, result.as_ref().err()).await;
+        self.close_out(open, result.as_ref().err()).await;
         result
     }
 
     async fn buffered_walk(
         &self,
-        client: &RegistryClient,
         layer: &SealedLayer,
         frames: &[Vec<u8>],
         recipe: &[u8],
         open: &mut OpenSession,
-    ) -> Result<()> {
+        tally: &mut LayerProgress,
+    ) -> Attempt {
         for _ in 0..MAX_RESUME {
-            let (session, missing) = self
-                .racing(client.chunked_negotiate(&self.repository, recipe))
-                .await
-                .ok_or_else(abandoned)??;
-            self.advance(skipped_bytes(layer, &missing));
+            let (session, missing) = self.negotiate(recipe).await?;
+            tally.negotiated(self, skipped_bytes(layer, &missing));
             open.hold(&session);
             let mut batch: Vec<u8> = Vec::new();
             let mut retry = false;
@@ -480,7 +502,7 @@ impl Uploader {
                 push_record(&mut batch, *index, frame);
                 if batch.len() >= MAX_BATCH_BYTES {
                     match self
-                        .flush(client, &session, std::mem::take(&mut batch))
+                        .flush(&session, std::mem::take(&mut batch), tally)
                         .await
                     {
                         Ok(true) => {
@@ -493,13 +515,13 @@ impl Uploader {
                 }
             }
             if !retry && !batch.is_empty() {
-                retry = match self.flush(client, &session, batch).await {
+                retry = match self.flush(&session, batch, tally).await {
                     Ok(retry) => retry,
                     Err(err) => return Err(open.spent(err)),
                 };
             }
             if !retry {
-                match self.finalize(client, &session, &layer.layer_digest).await {
+                match self.finalize(&session, &layer.layer_digest).await {
                     Ok(Finalized::Done) => {
                         open.finalized();
                         return Ok(());
@@ -520,27 +542,44 @@ impl Uploader {
     /// offers the very same recipe — which the registry answers with this same session
     /// and a `missing` set that no longer includes the frames this cycle uploaded. Handing
     /// the session back here would throw those frames away, and a node whose big layer is
-    /// cut every cycle would restart it from zero forever. An expired bearer reads the
-    /// same way: the attempt that re-mints one resumes this session.
+    /// cut every cycle would restart it from zero forever. An attempt cut short to be
+    /// retried on a fresh bearer reads the same way: the retry resumes this session.
     ///
     /// What is handed back is a session no retry will resume — see [`OpenSession::spent`].
     /// One `DELETE` releases its staged frames rather than leaving them for the registry's
-    /// idle TTL to collect.
+    /// idle TTL to collect. It goes out on the client the ladder last used: asking the
+    /// provider for a bearer on the way out of a failure could mean a login.
     ///
     /// Deliberately not raced against the cancellation token: this is a single bounded
     /// request rather than a read of the frozen view, and a cancelled ladder does not
     /// reach it with anything to send anyway. A failure is not reported — the session
     /// expires on its own.
-    async fn close_out(&self, client: &RegistryClient, open: OpenSession, err: Option<&CliError>) {
+    async fn close_out(&self, open: OpenSession, err: Option<&AttemptError>) {
         let Some(session) = open.id else {
             return;
         };
         // A cancelled cycle keeps its session whatever the step that noticed the cut
         // reported — the encoders surface the cut as a read error of their own.
-        if open.keep || self.is_cancelled() || matches!(err, Some(CliError::Auth(_))) {
+        if open.keep || self.is_cancelled() || matches!(err, Some(AttemptError::Retry(_))) {
             return;
         }
-        client.chunked_abandon(&self.repository, &session).await;
+        let client = self
+            .client
+            .lock()
+            .await
+            .as_ref()
+            .map(|(_, client)| client.clone());
+        if let Some(client) = client {
+            client.chunked_abandon(&self.repository, &session).await;
+        }
+    }
+
+    /// Offers the recipe: the session to send into and the frames the registry lacks.
+    async fn negotiate(&self, recipe: &[u8]) -> Result<(String, Vec<u32>)> {
+        let client = self.client(false).await?;
+        self.racing(client.chunked_negotiate(&self.repository, recipe))
+            .await
+            .ok_or_else(abandoned)?
     }
 
     /// `PATCH` one batch. `true` means the session went away and the caller should
@@ -549,19 +588,26 @@ impl Uploader {
     /// A batch the registry acknowledged is the upload's coarsest unit of progress:
     /// [`MAX_BATCH_BYTES`] is sized so that even a very slow link gets one through
     /// well inside the watchdog's patience for a counter that is not moving.
-    async fn flush(&self, client: &RegistryClient, session: &str, batch: Vec<u8>) -> Result<bool> {
-        let sent = batch.len() as u64;
+    async fn flush(
+        &self,
+        session: &str,
+        batch: Vec<u8>,
+        tally: &mut LayerProgress,
+    ) -> std::result::Result<bool, AttemptError> {
+        let sent = frame_bytes(&batch);
+        let client = self.client(false).await?;
         match self
             .racing(client.chunked_patch(&self.repository, session, batch))
             .await
             .ok_or_else(abandoned)?
         {
             Ok(()) => {
-                self.advance(sent);
+                tally.acked(self, sent);
                 Ok(false)
             }
             Err(ChunkedResume::Retry) => Ok(true),
-            Err(ChunkedResume::Fatal(err)) => Err(err),
+            Err(ChunkedResume::Dropped(err)) => Err(AttemptError::Retry(err)),
+            Err(ChunkedResume::Fatal(err)) => Err(err.into()),
         }
     }
 
@@ -569,10 +615,10 @@ impl Uploader {
     /// walked again.
     async fn finalize(
         &self,
-        client: &RegistryClient,
         session: &str,
         digest: &str,
-    ) -> Result<Finalized> {
+    ) -> std::result::Result<Finalized, AttemptError> {
+        let client = self.client(false).await?;
         match self
             .racing(client.chunked_finalize(&self.repository, session, digest))
             .await
@@ -580,7 +626,8 @@ impl Uploader {
         {
             Ok(()) => Ok(Finalized::Done),
             Err(ChunkedResume::Retry) => Ok(Finalized::Resume),
-            Err(ChunkedResume::Fatal(err)) => Err(err),
+            Err(ChunkedResume::Dropped(err)) => Err(AttemptError::Retry(err)),
+            Err(ChunkedResume::Fatal(err)) => Err(err.into()),
         }
     }
 
@@ -611,12 +658,18 @@ impl Uploader {
         .map_err(|err| join_error(&err))??;
 
         let recipe = recipe_bytes(&layer)?;
+        let mut tally = LayerProgress::default();
         for attempt in 0..2 {
-            let client = self.client(attempt > 0).await?;
-            let result = self.two_pass_ladder(&client, file, &layer, &recipe).await;
-            match result {
-                Err(CliError::Auth(_)) if attempt == 0 => {}
-                other => return other.map(|()| layer_ref(&layer)),
+            if attempt > 0 {
+                self.client(true).await?;
+            }
+            match self
+                .two_pass_ladder(file, &layer, &recipe, &mut tally)
+                .await
+            {
+                Ok(()) => return Ok(layer_ref(&layer)),
+                Err(AttemptError::Retry(_)) if attempt == 0 => {}
+                Err(err) => return Err(err.into()),
             }
         }
         Err(CliError::Auth(format!(
@@ -627,33 +680,30 @@ impl Uploader {
 
     async fn two_pass_ladder(
         &self,
-        client: &RegistryClient,
         file: &PlannedFile,
         layer: &SealedLayer,
         recipe: &[u8],
-    ) -> Result<()> {
+        tally: &mut LayerProgress,
+    ) -> Attempt {
         let mut open = OpenSession::default();
         let result = self
-            .two_pass_walk(client, file, layer, recipe, &mut open)
+            .two_pass_walk(file, layer, recipe, &mut open, tally)
             .await;
-        self.close_out(client, open, result.as_ref().err()).await;
+        self.close_out(open, result.as_ref().err()).await;
         result
     }
 
     async fn two_pass_walk(
         &self,
-        client: &RegistryClient,
         file: &PlannedFile,
         layer: &SealedLayer,
         recipe: &[u8],
         open: &mut OpenSession,
-    ) -> Result<()> {
+        tally: &mut LayerProgress,
+    ) -> Attempt {
         for _ in 0..MAX_RESUME {
-            let (session, missing) = self
-                .racing(client.chunked_negotiate(&self.repository, recipe))
-                .await
-                .ok_or_else(abandoned)??;
-            self.advance(skipped_bytes(layer, &missing));
+            let (session, missing) = self.negotiate(recipe).await?;
+            tally.negotiated(self, skipped_bytes(layer, &missing));
             open.hold(&session);
             let mut retry = false;
             if !missing.is_empty() {
@@ -669,13 +719,20 @@ impl Uploader {
                 let encode = tokio::task::spawn_blocking(move || {
                     second_pass(&source, &sealer, &wanted, &expected, &sender, &cancel)
                 });
+                // An attempt that will be retried waits for this pass's encoder like a
+                // resume does, so the retry's own pass never reads beside it.
+                let mut to_retry = None;
                 while let Some(batch) = receiver.recv().await {
-                    match self.flush(client, &session, batch).await {
+                    match self.flush(&session, batch, tally).await {
                         Ok(true) => {
                             retry = true;
                             break;
                         }
                         Ok(false) => {}
+                        Err(err @ AttemptError::Retry(_)) => {
+                            to_retry = Some(err);
+                            break;
+                        }
                         Err(err) => return Err(open.spent(err)),
                     }
                 }
@@ -687,6 +744,9 @@ impl Uploader {
                     Ok(encoded) => encoded,
                     Err(err) => return Err(open.spent(join_error(&err))),
                 };
+                if let Some(err) = to_retry {
+                    return Err(open.spent(err));
+                }
                 if !retry && let Err(err) = encoded {
                     // A second pass that could not be read or did not converge is this
                     // recipe's own failure — but a cancelled read reaches here too, and
@@ -695,7 +755,7 @@ impl Uploader {
                 }
             }
             if !retry {
-                match self.finalize(client, &session, &layer.layer_digest).await {
+                match self.finalize(&session, &layer.layer_digest).await {
                     Ok(Finalized::Done) => {
                         open.finalized();
                         return Ok(());
@@ -917,8 +977,14 @@ impl OpenSession {
     /// finalize, a re-encode that did not converge, a ladder out of negotiations. The
     /// session is handed back rather than left staged for a retry that would fail the
     /// same way. Returns `err` so a caller can `return Err(open.spent(err))`.
-    fn spent(&mut self, err: CliError) -> CliError {
-        self.keep = false;
+    ///
+    /// An error worth retrying on a fresh bearer spends nothing: that retry offers the
+    /// same recipe and resumes this session.
+    fn spent(&mut self, err: impl Into<AttemptError>) -> AttemptError {
+        let err = err.into();
+        if matches!(err, AttemptError::Fatal(_)) {
+            self.keep = false;
+        }
         err
     }
 }
@@ -929,6 +995,85 @@ enum Finalized {
     Done,
     /// The registry wants the ladder walked again.
     Resume,
+}
+
+/// How one attempt at a layer ended short of storing it.
+enum AttemptError {
+    /// Worth one more attempt on a freshly minted bearer: the registry refused the bearer,
+    /// or a `PATCH` or finalize got no answer at all — which is how that refusal arrives
+    /// over HTTP/1.1 when the registry turns a large body away unread.
+    Retry(CliError),
+    /// Anything else.
+    Fatal(CliError),
+}
+
+impl From<CliError> for AttemptError {
+    fn from(err: CliError) -> Self {
+        match err {
+            CliError::Auth(_) => Self::Retry(err),
+            other => Self::Fatal(other),
+        }
+    }
+}
+
+impl From<AttemptError> for CliError {
+    fn from(err: AttemptError) -> Self {
+        match err {
+            AttemptError::Retry(err) | AttemptError::Fatal(err) => err,
+        }
+    }
+}
+
+/// What one walk of a layer's ladder comes back with.
+type Attempt = std::result::Result<(), AttemptError>;
+
+/// One layer's share of the progress counter, across every negotiation of it.
+///
+/// A negotiation is answered with every frame the registry already holds, the ones an
+/// earlier attempt at this layer `PATCH`ed and credited included. Counting each attempt
+/// from zero would credit those frames again; the tally keeps the layer's best so far and
+/// credits only what an attempt gets past it. Both legs count frame bytes, so an attempt
+/// that resumes where the last one stopped starts level with it.
+#[derive(Default)]
+struct LayerProgress {
+    /// The most of this layer any attempt has got through, all of it credited.
+    best: u64,
+    /// What the current attempt has got through: held at negotiation, plus acknowledged.
+    attempt: u64,
+}
+
+impl LayerProgress {
+    /// A negotiation answered: `held` bytes of the layer are already in the registry.
+    fn negotiated(&mut self, uploader: &Uploader, held: u64) {
+        self.attempt = held;
+        self.credit(uploader);
+    }
+
+    /// A `PATCH` acknowledged, carrying `sent` bytes of frames.
+    fn acked(&mut self, uploader: &Uploader, sent: u64) {
+        self.attempt = self.attempt.saturating_add(sent);
+        self.credit(uploader);
+    }
+
+    fn credit(&mut self, uploader: &Uploader) {
+        if self.attempt > self.best {
+            uploader.advance(self.attempt - self.best);
+            self.best = self.attempt;
+        }
+    }
+}
+
+/// Frame bytes in a `PATCH` batch: its length less each record's eight-byte header, so a
+/// sent frame counts the same as the held one [`skipped_bytes`] counts.
+fn frame_bytes(batch: &[u8]) -> u64 {
+    let mut offset = 0usize;
+    let mut frames = 0u64;
+    while let Some(header) = batch.get(offset + 4..offset + 8) {
+        let len = u32::from_le_bytes(header.try_into().unwrap_or_default());
+        frames += u64::from(len);
+        offset += 8 + len as usize;
+    }
+    frames
 }
 
 /// What an abandoned upload comes back with, from whichever step noticed first.

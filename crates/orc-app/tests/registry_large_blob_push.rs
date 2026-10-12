@@ -65,6 +65,10 @@ struct Fake {
     /// While set, a `PATCH` is refused outright — the failure no retry of this layer can
     /// get past.
     reject_patches: Arc<AtomicBool>,
+    /// The `PATCH` (counting from 1; 0 is none) answered 401 before a byte of its body is
+    /// read — what the real registry does with a stale bearer. Over HTTP/1.1 the client,
+    /// still writing, usually sees the connection break rather than the status.
+    refuse_patch: Arc<std::sync::atomic::AtomicUsize>,
     /// Signalled when a stalled `PATCH` has arrived, so a test can cancel at exactly the
     /// moment the real ladder is mid-upload.
     patch_arrived: Arc<tokio::sync::Notify>,
@@ -225,12 +229,21 @@ async fn session_route(
     query: Option<&str>,
     body: Body,
 ) -> Response {
+    // Counted and refused before the body is touched, like the real registry's auth check.
+    let served = if *method == Method::PATCH {
+        let served = state.patches.fetch_add(1, Ordering::SeqCst);
+        if served + 1 == state.refuse_patch.load(Ordering::SeqCst) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        served
+    } else {
+        0
+    };
     let body = axum::body::to_bytes(body, usize::MAX)
         .await
         .expect("frames");
     match *method {
         Method::PATCH => {
-            let served = state.patches.fetch_add(1, Ordering::SeqCst);
             if state.reject_patches.load(Ordering::SeqCst) {
                 return StatusCode::BAD_REQUEST.into_response();
             }
@@ -437,6 +450,7 @@ fn fake() -> Fake {
         stall_after: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         patches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         reject_patches: Arc::new(AtomicBool::new(false)),
+        refuse_patch: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         patch_arrived: Arc::new(tokio::sync::Notify::new()),
         store: Arc::new(std::sync::Mutex::new(Store::default())),
     }
@@ -1691,6 +1705,100 @@ async fn a_cancelled_upload_keeps_its_session_so_the_next_cycle_resumes_it() {
             .iter()
             .all(|(_, repository)| repository == REPOSITORY),
         "both attempts addressed the app's own repository"
+    );
+}
+
+/// A provider that hands out a new bearer each time it is asked to refresh, and counts.
+struct RenewingToken {
+    refreshes: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl orc_app::persist::upload::TokenProvider for RenewingToken {
+    async fn bearer(&self, refresh: bool) -> orc_app::error::Result<String> {
+        let generation = if refresh {
+            self.refreshes.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            self.refreshes.load(Ordering::SeqCst)
+        };
+        Ok(format!("appdata-token-{generation}"))
+    }
+}
+
+/// A stale bearer on a `PATCH`: the registry answers 401 without reading the 8 MiB body.
+///
+/// Over HTTP/1.1 on a fast path that refusal seldom arrives as a status — the registry
+/// answers and closes while the client is still writing, and the client sees a broken
+/// pipe. Either way the upload must re-mint once, resume the same session, send only
+/// what the registry still lacks, and count every frame once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_patch_refused_unread_re_mints_and_resumes_the_session() {
+    use orc_app::persist::seal::{DataKey, Sealer};
+    use orc_app::persist::upload::Uploader;
+
+    let key = DataKey::new([31u8; 32]);
+    // Three batches' worth, so the refusal lands after one batch is already in.
+    let body = incompressible(20 * 1024 * 1024);
+
+    // What an uninterrupted upload of this layer counts, for comparison.
+    let control = {
+        let addr = serve(fake()).await;
+        let uploader = Uploader::new(
+            addr,
+            true,
+            REPOSITORY.to_owned(),
+            Arc::new(Sealer::new(&key)),
+            Arc::new(FixedToken),
+        );
+        uploader
+            .upload_bytes(body.clone())
+            .await
+            .expect("control upload");
+        uploader.progress_bytes()
+    };
+
+    let state = fake();
+    state.refuse_patch.store(2, Ordering::SeqCst);
+    let addr = serve(state.clone()).await;
+    let provider = Arc::new(RenewingToken {
+        refreshes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let uploader = Uploader::new(
+        addr,
+        true,
+        REPOSITORY.to_owned(),
+        Arc::new(Sealer::new(&key)),
+        Arc::clone(&provider) as Arc<dyn orc_app::persist::upload::TokenProvider>,
+    );
+    let layer = uploader
+        .upload_bytes(body)
+        .await
+        .expect("the upload survives a PATCH refused unread");
+
+    assert_eq!(
+        provider.refreshes.load(Ordering::SeqCst),
+        1,
+        "exactly one re-mint"
+    );
+    let store = state.store.lock().expect("store");
+    assert!(
+        store.blobs.contains_key(&layer.digest),
+        "the layer is stored"
+    );
+    assert_eq!(store.negotiations.len(), 2, "one negotiation per attempt");
+    let (first, second) = (&store.negotiations[0], &store.negotiations[1]);
+    assert_eq!(second.2, first.2, "the retry resumes the same session");
+    assert!(
+        second.1 < first.1,
+        "the batch acknowledged before the refusal is not asked for again: {} then {}",
+        first.1,
+        second.1
+    );
+    assert!(store.deleted.is_empty(), "nothing was handed back");
+    assert_eq!(
+        uploader.progress_bytes(),
+        control,
+        "the retry counts each frame once, exactly as an uninterrupted upload does"
     );
 }
 
