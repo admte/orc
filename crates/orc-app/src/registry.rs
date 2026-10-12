@@ -192,7 +192,7 @@ impl RegistryClient {
 
     fn with_auth(registry: &str, auth: Option<RegistryCredential>, insecure: bool) -> Result<Self> {
         let base = registry_base_url(registry, insecure);
-        let http = reqwest::Client::builder()
+        let http = transfer_http_builder()
             .build()
             .map_err(|err| CliError::Operational(format!("build registry client: {err}")))?;
         Ok(Self {
@@ -2079,6 +2079,23 @@ pub(crate) fn verify_digest(body: &[u8], expected: &str) -> Result<()> {
     }
 }
 
+/// The HTTP client every registry request rides: HTTP/1.1 only.
+///
+/// A registry moves blobs of many megabytes, one request at a time, and over HTTP/2 a
+/// request can never have more in flight than the stream window its receiver grants.
+/// An orc server grants 256 KiB per stream — small on purpose: an agent multiplexes its
+/// control channel and every tunnel onto one connection, and each stalled stream holds
+/// its window out of the connection's — so an upload over HTTP/2 moves at most 256 KiB
+/// per round trip: 1.7 MB/s at 150 ms, 0.8 MB/s at 300 ms. Downloads hit the same wall
+/// from this side's default 2 MiB window. HTTP/1.1 leaves flow control to TCP, which
+/// sizes its window to the path: 13 MB/s up at 150 ms against the same server.
+///
+/// The cost is a connection per concurrent request instead of one shared one, which a
+/// client issuing its requests in sequence does not pay.
+fn transfer_http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().http1_only()
+}
+
 fn registry_base_url(registry: &str, insecure: bool) -> String {
     if registry == "ghcr.io"
         && let Ok(base) = std::env::var("ORC_GHCR_REGISTRY_BASE_URL")
@@ -2101,6 +2118,34 @@ fn is_loopback(registry: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registry transfers must not ride HTTP/2, where one request is capped at the
+    /// server's stream window per round trip (see [`transfer_http_builder`]). The
+    /// protocols the client offers in its TLS hello are what decide that, so that is
+    /// what this reads; the handshake itself is never finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_transfers_offer_only_http1() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let start =
+                tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream)
+                    .await
+                    .expect("client hello");
+            start
+                .client_hello()
+                .alpn()
+                .map(|offered| offered.map(<[u8]>::to_vec).collect::<Vec<_>>())
+        });
+        let client = transfer_http_builder().build().expect("client");
+        // Fails once the server walks away after the hello; only the hello matters.
+        let _ = client.get(format!("https://{addr}/v2/")).send().await;
+        let offered = server.await.expect("server task");
+        assert_eq!(offered, Some(vec![b"http/1.1".to_vec()]));
+    }
 
     fn bearer(realm: &str, service: Option<&str>, scope: Option<&str>) -> AuthChallenge {
         AuthChallenge::Bearer(BearerChallenge {
