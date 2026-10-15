@@ -48,7 +48,8 @@
 //! HTTP/1.1 that refusal rarely arrives as a status: the registry answers and closes, and
 //! the client, still writing, sees a broken pipe. So a `PATCH` or finalize that got no
 //! answer at all is treated as the 401 it most likely was — one re-mint, one more attempt,
-//! the session kept for it — and a second failure surfaces as it is.
+//! the session kept for it — and a second failure surfaces as it is. A negotiation that
+//! got no answer gets the same one retry.
 //!
 //! # Abandoning an upload
 //!
@@ -575,11 +576,29 @@ impl Uploader {
     }
 
     /// Offers the recipe: the session to send into and the frames the registry lacks.
-    async fn negotiate(&self, recipe: &[u8]) -> Result<(String, Vec<u32>)> {
+    ///
+    /// A negotiation that got no answer is retried like a `PATCH` that got none — one
+    /// re-mint, one more attempt — rather than failing the layer and with it the cycle:
+    /// it rides the same connections and loses its answer the same ways. Offering the
+    /// same recipe again is safe; the registry answers it with the session it already
+    /// holds for it, so a `POST` that landed and lost only its answer opens nothing new.
+    async fn negotiate(
+        &self,
+        recipe: &[u8],
+    ) -> std::result::Result<(String, Vec<u32>), AttemptError> {
         let client = self.client(false).await?;
-        self.racing(client.chunked_negotiate(&self.repository, recipe))
+        match self
+            .racing(client.chunked_negotiate(&self.repository, recipe))
             .await
             .ok_or_else(abandoned)?
+        {
+            Ok(negotiated) => Ok(negotiated),
+            Err(ChunkedResume::Dropped(err)) => Err(AttemptError::Retry(err)),
+            Err(ChunkedResume::Fatal(err)) => Err(err.into()),
+            Err(ChunkedResume::Retry) => Err(AttemptError::Retry(CliError::Operational(
+                "app data: the registry asked for the recipe again".to_owned(),
+            ))),
+        }
     }
 
     /// `PATCH` one batch. `true` means the session went away and the caller should
