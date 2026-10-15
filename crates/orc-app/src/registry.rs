@@ -823,10 +823,15 @@ impl RegistryClient {
         for _ in 0..MAX_RESUME {
             let (session, missing) = match self.chunked_negotiate(repository, &recipe_bytes).await {
                 Ok(negotiated) => negotiated,
-                Err(err) => {
+                // A dropped negotiation is not retried here: whatever ends this ladder
+                // falls back to the monolithic path, which is this push's retry.
+                Err(ChunkedResume::Dropped(err) | ChunkedResume::Fatal(err)) => {
                     outcome = Err(err);
                     break;
                 }
+                // Not an answer a negotiation gives; offering the recipe again is what
+                // it would ask for.
+                Err(ChunkedResume::Retry) => continue,
             };
             open = Some(session.clone());
             match self
@@ -896,11 +901,17 @@ impl RegistryClient {
     }
 
     /// POST the recipe; returns `(session_id, missing indices)`.
+    ///
+    /// A `POST` the connection failed under — no answer, or an answer cut off before its
+    /// body arrived — comes back [`ChunkedResume::Dropped`], apart from every refusal,
+    /// for a caller that can offer the recipe again. Offering it again is safe: the
+    /// registry answers a recipe it already holds a session for with that session, so a
+    /// `POST` that did land and lost only its answer opens nothing new.
     pub(crate) async fn chunked_negotiate(
         &self,
         repository: &str,
         recipe_bytes: &[u8],
-    ) -> Result<(String, Vec<u32>)> {
+    ) -> std::result::Result<(String, Vec<u32>), ChunkedResume> {
         #[derive(serde::Deserialize)]
         struct OpenSession {
             session_id: String,
@@ -909,7 +920,7 @@ impl RegistryClient {
         }
         let path = format!("/v2/{repository}/_orc/chunked-uploads/");
         let response = self
-            .execute(
+            .execute_classified(
                 Method::POST,
                 &self.url_for_path(&path),
                 &[("content-type", "application/json")],
@@ -920,18 +931,24 @@ impl RegistryClient {
         // of this same client were cut off without being closed out, not that anything
         // about this layer is wrong, and it clears itself.
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(sessions_held(response).await);
+            return Err(ChunkedResume::Fatal(sessions_held(response).await));
         }
         if response.status() != reqwest::StatusCode::OK {
-            return Err(CliError::Operational(format!(
+            return Err(ChunkedResume::Fatal(CliError::Operational(format!(
                 "chunked negotiate POST returned {}",
                 response.status()
-            )));
+            ))));
         }
-        let body: OpenSession = response
-            .json()
-            .await
-            .map_err(|err| CliError::Operational(format!("decode chunked session: {err}")))?;
+        let body = response.bytes().await.map_err(|err| {
+            ChunkedResume::Dropped(CliError::Operational(format!(
+                "registry POST {path}: the answer was cut off: {err}"
+            )))
+        })?;
+        let body: OpenSession = serde_json::from_slice(&body).map_err(|err| {
+            ChunkedResume::Fatal(CliError::Operational(format!(
+                "decode chunked session: {err}"
+            )))
+        })?;
         Ok((body.session_id, body.missing))
     }
 
@@ -2196,6 +2213,81 @@ mod tests {
             Err(ChunkedResume::Retry) => panic!("classified as a lost session"),
             Ok(()) => panic!("a PATCH nobody answered succeeded"),
         }
+    }
+
+    /// Serves one connection with `answer` written after the request head, then hangs
+    /// up. Returns the address and the thread to join.
+    fn answer_once(answer: &'static [u8]) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut head = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut head);
+            let _ = std::io::Write::write_all(&mut stream, answer);
+        });
+        (addr, server)
+    }
+
+    async fn negotiate_against(
+        answer: &'static [u8],
+    ) -> std::result::Result<(String, Vec<u32>), ChunkedResume> {
+        let (addr, server) = answer_once(answer);
+        let client =
+            RegistryClient::with_bearer(&addr.to_string(), "tok".to_owned(), true).expect("client");
+        let result = client.chunked_negotiate("acme/app", b"{}").await;
+        server.join().expect("server thread");
+        result
+    }
+
+    /// A negotiation the connection breaks under is `Dropped` like a `PATCH`, so the
+    /// uploader offers the recipe again on a fresh bearer instead of failing the layer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_negotiation_nobody_answered_is_dropped_not_fatal() {
+        match negotiate_against(b"").await {
+            Err(ChunkedResume::Dropped(_)) => {}
+            Err(ChunkedResume::Fatal(err)) => panic!("classified fatal: {err}"),
+            Err(ChunkedResume::Retry) => panic!("classified as a lost session"),
+            Ok(_) => panic!("a negotiation nobody answered succeeded"),
+        }
+    }
+
+    /// And so is one whose answer is cut off before its body arrived: the session it
+    /// may have opened is the one the next offer of the recipe resumes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_negotiation_answer_cut_off_mid_body_is_dropped_not_fatal() {
+        let answer = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                       content-length: 64\r\n\r\n{\"session_id\":";
+        match negotiate_against(answer).await {
+            Err(ChunkedResume::Dropped(_)) => {}
+            Err(ChunkedResume::Fatal(err)) => panic!("classified fatal: {err}"),
+            Err(ChunkedResume::Retry) => panic!("classified as a lost session"),
+            Ok(_) => panic!("a truncated answer was accepted"),
+        }
+    }
+
+    /// An answer that arrived whole is the registry's own, retried or not: one that is
+    /// not a session is fatal, and so is a refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_negotiation_that_was_answered_is_never_dropped() {
+        let not_a_session = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                              content-length: 2\r\nconnection: close\r\n\r\n{}";
+        assert!(
+            matches!(
+                negotiate_against(not_a_session).await,
+                Err(ChunkedResume::Fatal(_))
+            ),
+            "an answer that is not a session"
+        );
+        let refused =
+            b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+        assert!(
+            matches!(
+                negotiate_against(refused).await,
+                Err(ChunkedResume::Fatal(_))
+            ),
+            "a refusal"
+        );
     }
 
     /// Registry transfers must not ride HTTP/2, where one request is capped at the
