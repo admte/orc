@@ -269,6 +269,10 @@ pub struct Uploader {
     /// Bytes this uploader has got through, only ever going up. See the module docs:
     /// callers read it to tell a slow upload from a stopped one.
     progress: Arc<AtomicU64>,
+    /// Frame bytes the registry acknowledged receiving from this uploader — the wire
+    /// cost, apart from everything the progress counter also credits. See
+    /// [`Uploader::sent_bytes`].
+    sent: AtomicU64,
 }
 
 impl std::fmt::Debug for Uploader {
@@ -303,6 +307,7 @@ impl Uploader {
             client: tokio::sync::Mutex::new(None),
             cancel: CancellationToken::new(),
             progress: Arc::new(AtomicU64::new(0)),
+            sent: AtomicU64::new(0),
         }
     }
 
@@ -321,6 +326,18 @@ impl Uploader {
     #[must_use]
     pub fn progress_bytes(&self) -> u64 {
         self.progress.load(Ordering::Relaxed)
+    }
+
+    /// Frame bytes this uploader has actually sent and had acknowledged, across every
+    /// layer and every attempt at one.
+    ///
+    /// What a capture cost on the wire, which is not what it holds: a layer the registry
+    /// already had — a retained point's, or one an interrupted cycle finished — costs
+    /// nothing here however large it is. An operator reading why a save took as long as
+    /// it did wants this figure, not the size of the point.
+    #[must_use]
+    pub fn sent_bytes(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
     }
 
     /// Records `bytes` of progress. Relaxed: the watchdog polls the value on a timer and
@@ -622,6 +639,7 @@ impl Uploader {
         {
             Ok(()) => {
                 tally.acked(self, sent);
+                self.sent.fetch_add(sent, Ordering::Relaxed);
                 Ok(false)
             }
             Err(ChunkedResume::Retry) => Ok(true),
