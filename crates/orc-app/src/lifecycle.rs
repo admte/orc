@@ -779,6 +779,11 @@ pub async fn exec_app(work_dir: &Path, app: &str, instance: &str, version: &str)
         let error = {
             use std::os::unix::process::CommandExt as _;
             let mut command = start.command;
+            // A unit hands stdout and stderr to the journal as one stream at one
+            // priority; the app's errors get a stream of their own, so the runtime
+            // following the unit can tell them apart.
+            #[cfg(target_os = "linux")]
+            crate::service::journal::stderr_at_warning(command.as_std_mut());
             command.as_std_mut().exec()
         };
         Err(CliError::Operational(format!("start the app: {error}")))
