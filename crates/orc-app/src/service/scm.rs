@@ -34,6 +34,7 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use super::{RestartPolicy, ServiceBackend, ServiceSpec, ServiceState, ServiceStatus};
 use crate::error::{CliError, Result};
+use crate::process::LogStream;
 
 /// Delay before the SCM restarts a service under its recovery actions. The same five
 /// seconds systemd's `RestartSec=` gets, so a flapping app behaves alike on both.
@@ -297,7 +298,9 @@ impl ServiceBackend for Scm {
         ))
     }
 
-    fn logs(&self, name: &str, work_dir: &Path) -> Option<BoxStream<'static, String>> {
+    /// The shim's copy holds stdout and stderr as one stream, so every line reads as
+    /// stdout.
+    fn logs(&self, name: &str, work_dir: &Path) -> Option<BoxStream<'static, (LogStream, String)>> {
         let path = log_path(work_dir);
         let name = name.to_owned();
         let (sender, receiver) = tokio::sync::mpsc::channel(LOG_BUFFER);
@@ -306,7 +309,12 @@ impl ServiceBackend for Scm {
         std::thread::spawn(move || tail(&path, &name, &sender));
         Some(Box::pin(futures_util::stream::unfold(
             receiver,
-            |mut receiver| async move { receiver.recv().await.map(|line| (line, receiver)) },
+            |mut receiver| async move {
+                receiver
+                    .recv()
+                    .await
+                    .map(|line| ((LogStream::Stdout, line), receiver))
+            },
         )))
     }
 }

@@ -18,8 +18,9 @@ use futures_util::stream::BoxStream;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::process::Command;
 
-use super::{RestartPolicy, ServiceBackend, ServiceSpec, ServiceState, ServiceStatus};
+use super::{RestartPolicy, ServiceBackend, ServiceSpec, ServiceState, ServiceStatus, journal};
 use crate::error::{CliError, Result};
+use crate::process::LogStream;
 
 /// Where generated units live. Not `/run`: a runtime-managed app must survive a reboot
 /// as a definition, even though it is never started by one.
@@ -251,17 +252,31 @@ impl ServiceBackend for Systemd {
         ))
     }
 
-    /// Follows the unit's journal from now on, one line per record.
+    /// Follows the unit's journal from now on, one line per record, each read by
+    /// [`journal::journal_lines`] for the stream it stands for.
     ///
     /// `--lines 0` starts at the present: the runtime is adopting or starting the app
     /// here, and replaying the last boot's output into the node log would date-stamp
-    /// old failures as if they had just happened.
-    fn logs(&self, name: &str, _work_dir: &Path) -> Option<BoxStream<'static, String>> {
+    /// old failures as if they had just happened. JSON rather than bare messages,
+    /// because the priority is what tells a traceback from a progress line.
+    fn logs(
+        &self,
+        name: &str,
+        _work_dir: &Path,
+    ) -> Option<BoxStream<'static, (LogStream, String)>> {
         // The journal already holds the unit's output; where the app's files sit is
         // beside the point.
         let mut child = Command::new("journalctl")
             .args([
-                "--unit", name, "--follow", "--lines", "0", "--output", "cat",
+                "--unit",
+                name,
+                "--follow",
+                "--lines",
+                "0",
+                "--output",
+                "json",
+                "--output-fields",
+                journal::FIELDS,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -277,16 +292,17 @@ impl ServiceBackend for Systemd {
             })
             .ok()?;
         let stdout = child.stdout.take()?;
-        let lines = tokio::io::BufReader::new(stdout).lines();
-        Some(Box::pin(futures_util::stream::unfold(
-            (lines, child),
-            |(mut lines, child)| async move {
-                match lines.next_line().await {
-                    Ok(Some(line)) => Some((line, (lines, child))),
+        let records = tokio::io::BufReader::new(stdout).lines();
+        let records =
+            futures_util::stream::unfold((records, child), |(mut records, child)| async move {
+                match records.next_line().await {
+                    Ok(Some(record)) => Some((record, (records, child))),
                     _ => None,
                 }
-            },
-        )))
+            });
+        Some(Box::pin(records.flat_map(|record| {
+            futures_util::stream::iter(journal::journal_lines(&record))
+        })))
     }
 
     fn watch(&self, name: &str) -> BoxStream<'static, ServiceStatus> {
