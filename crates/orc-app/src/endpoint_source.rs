@@ -11,6 +11,11 @@
 //! into telling an author two different stories about the same package — and so the
 //! wording is pinned by the tests at the bottom of this file rather than by matching
 //! assertions maintained on both sides.
+//!
+//! The names the `peers.*` kinds hand out are spelled here too ([`spread_name`],
+//! [`member_name`]): a pool is named in its project's internal zone, or — once its
+//! members hold a public service certificate — under its public anchor service
+//! (spec 188), and every runtime has to agree on which.
 
 /// Which fact about an endpoint one `endpoint.*` source kind asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +157,57 @@ pub fn org_zone(org_code: &str, public_base_domain: &str) -> Option<String> {
         return None;
     }
     Some(qualify(org_code, public_base_domain))
+}
+
+/// Where a pool's member names hang (spec 188): its project's internal zone, or —
+/// on a public-named pool — its public anchor service.
+///
+/// The `peers.*` kinds name a pool and its members under one of these, and every
+/// runtime that hands those names out builds them here so they cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberDomain<'a> {
+    /// `{project}.{suffix}`: the pool is named internally.
+    Internal { project: &'a str, suffix: &'a str },
+    /// `{anchor}.{org zone}` ([`public_member_domain`]): the pool's members hold the
+    /// anchor's service certificate, whose subtree wildcard proves every member name
+    /// under it, and are known by those names only.
+    Public(&'a str),
+}
+
+/// `{anchor}.{org zone}` — the domain a public-named pool's members are named under:
+/// its anchor service's own public name.
+#[must_use]
+pub fn public_member_domain(anchor: &str, zone: &str) -> String {
+    qualify(anchor, zone)
+}
+
+/// The name that answers every member of `pool` — `peers.gossip` and `peers.any`.
+///
+/// Internally the pool's own name, `{pool}.{project}.{suffix}`. On a public-named
+/// pool the anchor's service name, `{anchor}.{org zone}`: the one name its
+/// certificate proves that answers the pool as a whole.
+#[must_use]
+pub fn spread_name(pool: &str, domain: MemberDomain<'_>) -> String {
+    match domain {
+        MemberDomain::Internal { project, suffix } => {
+            qualify(pool, &internal_zone(project, suffix))
+        }
+        MemberDomain::Public(domain) => domain.to_owned(),
+    }
+}
+
+/// The name of the member of `pool` holding `slot` — `peers.first` (slot 1) and each
+/// line of `peers.all`: `{pool}-{slot}.{project}.{suffix}` internally,
+/// `{pool}-{slot}.{anchor}.{org zone}` on a public-named pool.
+#[must_use]
+pub fn member_name(pool: &str, slot: u64, domain: MemberDomain<'_>) -> String {
+    let label = format!("{pool}-{slot}");
+    match domain {
+        MemberDomain::Internal { project, suffix } => {
+            qualify(&label, &internal_zone(project, suffix))
+        }
+        MemberDomain::Public(domain) => qualify(&label, domain),
+    }
 }
 
 /// The endpoint an `endpoint.*` declaration means: the one `requested` names, or the
@@ -611,6 +667,62 @@ mod tests {
         assert_eq!(
             resolved(EndpointFact::Port, &declared, Some(""), &naming()).expect("port"),
             "5432"
+        );
+    }
+
+    /// Spec 188's table: a private pool's names sit in its project's zone, a
+    /// public-named pool's under its anchor service, the spread name being the
+    /// anchor's own name and every member one label below it.
+    #[test]
+    fn member_names_follow_the_domain_they_hang_under() {
+        let internal = MemberDomain::Internal {
+            project: "shop",
+            suffix: "internal",
+        };
+        assert_eq!(spread_name("pgp3", internal), "pgp3.shop.internal");
+        assert_eq!(member_name("pgp3", 1, internal), "pgp3-1.shop.internal");
+
+        let anchor = public_member_domain("pgp3", "sys.v0.orc8r.com");
+        assert_eq!(anchor, "pgp3.sys.v0.orc8r.com");
+        let public = MemberDomain::Public(&anchor);
+        assert_eq!(spread_name("pgp3", public), "pgp3.sys.v0.orc8r.com");
+        assert_eq!(
+            member_name("pgp3", 1, public),
+            "pgp3-1.pgp3.sys.v0.orc8r.com"
+        );
+        assert_eq!(
+            member_name("pgp3", 12, public),
+            "pgp3-12.pgp3.sys.v0.orc8r.com"
+        );
+    }
+
+    /// Several services: the members live under the anchor, while an endpoint's own
+    /// name stays its own service's — `grpc` is `grpc.{org zone}` even though the
+    /// members are `{pool}-{slot}.api.{org zone}`.
+    #[test]
+    fn an_endpoint_keeps_its_own_service_name_beside_the_anchor() {
+        let anchor = public_member_domain("api", "acme.v0.orc8r.com");
+        assert_eq!(
+            member_name("web", 2, MemberDomain::Public(&anchor)),
+            "web-2.api.acme.v0.orc8r.com"
+        );
+        let grpc = SurfaceEndpoint {
+            expose: "public",
+            service_name: Some("grpc"),
+            public_zone: "acme.v0.orc8r.com",
+            ..surface("grpc", "https", 443)
+        };
+        let api = SurfaceEndpoint {
+            expose: "public",
+            service_name: Some("api"),
+            public_zone: "acme.v0.orc8r.com",
+            ..surface("api", "https", 443)
+        };
+        assert_eq!(canonical_name(&grpc, &naming()), "grpc.acme.v0.orc8r.com");
+        assert_eq!(
+            canonical_name(&api, &naming()),
+            anchor,
+            "the anchor's own endpoint is named by the anchor's domain"
         );
     }
 }
