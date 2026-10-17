@@ -106,7 +106,8 @@ pub(crate) fn render_unit(spec: &ServiceSpec) -> String {
          RestartSec=5\n\
          KillMode=control-group\n\
          KillSignal={signal}\n\
-         TimeoutStopSec={stop_timeout}\n",
+         TimeoutStopSec={stop_timeout}\n\
+         SyslogLevelPrefix=no\n",
         description = escape_specifiers(&one_line(&spec.description)),
         limit_window = RESTART_LIMIT_WINDOW.as_secs(),
         limit_burst = RESTART_LIMIT_BURST,
