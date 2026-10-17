@@ -181,6 +181,8 @@ pub trait ServiceBackend: Send + Sync {
     /// Removes a definition this runtime wrote. Refuses one it did not.
     async fn undefine(&self, name: &str) -> Result<()>;
 
+    /// Starts the service. Only ever a start somebody asked for, never the manager's
+    /// own restart, so a service the manager gave up on is started all the same.
     async fn start(&self, name: &str) -> Result<()>;
 
     /// Asks the manager to stop the service, and returns without waiting for it to

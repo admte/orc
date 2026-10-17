@@ -203,8 +203,18 @@ impl ServiceBackend for Systemd {
         Ok(())
     }
 
+    /// Every start that comes through here is a deliberate one — the manager's own
+    /// restarts never do — so a unit the manager gave up on is given another chance
+    /// first: `reset-failed` clears the failed state and the start-limit count with it,
+    /// which would otherwise refuse this start too. A crash loop the manager gave up on
+    /// stays given up until somebody asks again.
     async fn start(&self, name: &str) -> Result<()> {
-        systemctl(&["start", name]).await?;
+        let [reset, start] = start_argv(name);
+        // Refused for a unit the manager has not loaded; the start says why better.
+        if let Err(err) = systemctl(&reset.iter().map(String::as_str).collect::<Vec<_>>()).await {
+            tracing::debug!(service = %name, error = %err, "failed state not cleared");
+        }
+        systemctl(&start.iter().map(String::as_str).collect::<Vec<_>>()).await?;
         tracing::info!(service = %name, "service start requested");
         Ok(())
     }
@@ -545,6 +555,15 @@ fn kill_argv(name: &str) -> Vec<Vec<String>> {
     ]
 }
 
+/// The manager calls that start a unit, in order: clear what a failed run left, then
+/// start.
+fn start_argv(name: &str) -> [Vec<String>; 2] {
+    [
+        vec!["reset-failed".to_owned(), name.to_owned()],
+        vec!["start".to_owned(), name.to_owned()],
+    ]
+}
+
 async fn systemctl(arguments: &[&str]) -> Result<()> {
     let output = Command::new("systemctl")
         .args(arguments)
@@ -569,7 +588,20 @@ fn operational(what: &str, err: impl std::fmt::Display) -> CliError {
 
 #[cfg(test)]
 mod kill_order_tests {
-    use super::kill_argv;
+    use super::{kill_argv, start_argv};
+
+    /// A unit that hit its start limit refuses a plain `start` until the hour is up;
+    /// a start somebody asked for clears that first.
+    #[test]
+    fn starting_a_unit_clears_its_failed_state_first() {
+        assert_eq!(
+            start_argv("demo.service"),
+            [
+                vec!["reset-failed".to_owned(), "demo.service".to_owned()],
+                vec!["start".to_owned(), "demo.service".to_owned()],
+            ]
+        );
+    }
 
     /// A forced stop jumps straight to the kill, so the kill has to be safe on its
     /// own. Without the stop job in front of it the manager reads the death as a
