@@ -182,7 +182,8 @@ mod systemd_units {
              RestartSec=5\n\
              KillMode=control-group\n\
              KillSignal=SIGTERM\n\
-             TimeoutStopSec=30\n"
+             TimeoutStopSec=30\n\
+             SyslogLevelPrefix=no\n"
         );
     }
 

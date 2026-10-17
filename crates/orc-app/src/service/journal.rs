@@ -100,11 +100,12 @@ fn open_stream(identifier: &str, priority: u8) -> std::io::Result<UnixStream> {
 /// (empty: journald finds it from the peer's cgroup), priority, whether a `<N>` prefix
 /// on a line overrides the priority, and the three forward-to flags.
 ///
-/// The level prefix is honoured, as systemd's `SyslogLevelPrefix=` default does for the
-/// stream it opens itself.
+/// The level prefix is not read: stderr is warning and nothing else, so a line the app
+/// happens to start with `<N>` keeps it as text, as the unit's `SyslogLevelPrefix=no`
+/// does for stdout.
 fn stream_header(identifier: &str, priority: u8) -> String {
     let identifier = identifier.replace('\n', " ");
-    format!("{identifier}\n\n{priority}\n1\n0\n0\n0\n")
+    format!("{identifier}\n\n{priority}\n0\n0\n0\n0\n")
 }
 
 /// The lines in one `journalctl --output json` record, each with the stream it reads
@@ -183,7 +184,7 @@ mod tests {
             journal_lines(&record("6", "4242", "orc-agent", "INFO: loading weights")),
             vec![(LogStream::Stdout, "INFO: loading weights".to_owned())]
         );
-        // An app that tags a line `<3>` on stdout gets err, and that is stderr too.
+        // Anything at err or worse is stderr too, whoever logged it.
         assert_eq!(
             journal_lines(&record("3", "4242", "orc-agent", "out of memory")),
             vec![(LogStream::Stderr, "out of memory".to_owned())]
@@ -275,10 +276,10 @@ mod tests {
     fn the_stream_header_is_what_journald_reads() {
         assert_eq!(
             stream_header("orc-agent", LOG_WARNING),
-            "orc-agent\n\n4\n1\n0\n0\n0\n"
+            "orc-agent\n\n4\n0\n0\n0\n0\n"
         );
         // An identifier cannot shift the fields after it.
-        assert_eq!(stream_header("a\nb", 4), "a b\n\n4\n1\n0\n0\n0\n");
+        assert_eq!(stream_header("a\nb", 4), "a b\n\n4\n0\n0\n0\n0\n");
     }
 
     /// Under a unit this would be true; outside one there is no journal stream to
