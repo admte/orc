@@ -103,7 +103,9 @@
 //! things stay as they were. Nothing is committed until every layer is stored — the call
 //! returns the references only when all of them are. And at most
 //! [`BUFFERED_LAYERS_IN_FLIGHT`] pack layers are sealed into memory at a time, so the
-//! parallelism multiplies connections, not the ~68 MiB a pack is held in.
+//! parallelism multiplies connections, not the ~68 MiB a pack is held in. Layers start
+//! largest first, so a big layer a cut cycle left half-sent resumes its session before
+//! any new one is opened beside it.
 //!
 //! The first layer to fail fails the call, and spends the uploader: it is cancelled, as a
 //! cut would cancel it, so the other ladders stop and **keep** their sessions — the next
@@ -176,15 +178,28 @@ const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 /// Re-negotiations before an upload is declared stuck. Matches the image path's budget.
 const MAX_RESUME: usize = 3;
 
-/// One layer's upload inside [`Uploader::upload_layers_with`]: its plan position, its
-/// reference, the frame bytes it sent, and how long it took.
+/// One layer's upload inside [`Uploader::upload_layers_with`]: its plan position, whether
+/// it was a pack, and its reference, the frame bytes it sent and how long it took.
 type LayerFuture<'a> = std::pin::Pin<
     Box<
-        dyn std::future::Future<Output = Result<(usize, LayerRef, u64, std::time::Duration)>>
-            + Send
+        dyn std::future::Future<
+                Output = (usize, bool, Result<(LayerRef, u64, std::time::Duration)>),
+            > + Send
             + 'a,
     >,
 >;
+
+/// How long a freshly minted bearer answers every ladder's refresh. See
+/// [`Uploader::client`].
+const SHARED_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The client an uploader holds, for the bearer it was built with.
+struct CachedClient {
+    token: String,
+    client: RegistryClient,
+    /// When a refresh minted this bearer, if one did.
+    refreshed: Option<Instant>,
+}
 
 /// Pack layers sealed into memory at once by [`Uploader::upload_layers`]. A pack is held
 /// whole while it is negotiated (~68 MiB at worst, see
@@ -296,8 +311,8 @@ pub struct Uploader {
     repository: String,
     sealer: Arc<Sealer>,
     provider: Arc<dyn TokenProvider>,
-    /// The client built for the bearer the provider last handed out, and that bearer.
-    client: tokio::sync::Mutex<Option<(String, RegistryClient)>>,
+    /// The client built for the bearer the provider last handed out.
+    client: tokio::sync::Mutex<Option<CachedClient>>,
     /// Cut by [`Uploader::cancel`]. One uploader serves one app of one capture cycle, so
     /// the token is scoped to that too: nothing re-arms it, and a cancelled uploader is
     /// spent — as is the cycle, which never goes on to another app after a cut.
@@ -416,16 +431,35 @@ impl Uploader {
     /// Asked before every request rather than once per layer: the provider is what knows
     /// when its bearer expires, and a layer can take longer than a bearer lives. A new
     /// client is built only when the bearer changed.
+    ///
+    /// Several layers upload at once, and one expired bearer is refused to all of them at
+    /// about the same moment. So a refresh is single-flight: the lock is held across it,
+    /// and a ladder that asks for one within [`SHARED_REFRESH`] of another's is handed
+    /// that fresh client instead of minting yet another bearer.
     async fn client(&self, refresh: bool) -> Result<RegistryClient> {
-        let token = self.provider.bearer(refresh).await?;
         let mut cached = self.client.lock().await;
-        if let Some((held, client)) = cached.as_ref()
-            && *held == token
+        if refresh
+            && let Some(held) = cached.as_ref()
+            && held
+                .refreshed
+                .is_some_and(|at| at.elapsed() < SHARED_REFRESH)
         {
-            return Ok(client.clone());
+            return Ok(held.client.clone());
+        }
+        let token = self.provider.bearer(refresh).await?;
+        let refreshed = refresh.then(Instant::now);
+        if let Some(held) = cached.as_mut()
+            && held.token == token
+        {
+            held.refreshed = refreshed.or(held.refreshed);
+            return Ok(held.client.clone());
         }
         let client = RegistryClient::with_bearer(&self.registry, token.clone(), self.insecure)?;
-        *cached = Some((token, client.clone()));
+        *cached = Some(CachedClient {
+            token,
+            client: client.clone(),
+            refreshed,
+        });
         Ok(client)
     }
 
@@ -475,38 +509,51 @@ impl Uploader {
         plans: &[LayerPlan],
         concurrency: usize,
     ) -> Result<Vec<LayerRef>> {
-        let buffered = tokio::sync::Semaphore::new(BUFFERED_LAYERS_IN_FLIGHT);
         let total = plans.len();
         let mut stored: Vec<Option<LayerRef>> = vec![None; total];
-        let mut queue = plans.iter().enumerate();
+        // Largest first. A layer a cut cycle left half-sent is most often the big one, and
+        // starting it first resumes its kept session before any new session is opened —
+        // the registry caps sessions per principal and makes room by abandoning the least
+        // recently active, which would otherwise be that one. It also keeps one long
+        // layer from starting last and running on alone.
+        let mut pending: Vec<usize> = (0..total).collect();
+        pending.sort_by_key(|position| std::cmp::Reverse(plans[*position].bytes));
+        let mut packs = 0usize;
         let mut running = FuturesUnordered::new();
         let mut failure: Option<CliError> = None;
         loop {
             while failure.is_none() && running.len() < concurrency.max(1) {
-                let Some((position, plan)) = queue.next() else {
+                // The next layer that may start: a pack only while fewer than
+                // BUFFERED_LAYERS_IN_FLIGHT are held in memory, so a run of packs waits
+                // without holding slots a whole-file layer behind it could use.
+                let Some(next) = pending.iter().position(|position| {
+                    plans[*position].kind != LayerKind::Pack || packs < BUFFERED_LAYERS_IN_FLIGHT
+                }) else {
                     break;
                 };
-                let buffered = &buffered;
+                let position = pending.remove(next);
+                let plan = &plans[position];
+                let is_pack = plan.kind == LayerKind::Pack;
+                packs += usize::from(is_pack);
                 // Boxed as a `Send` trait object: the ladder's future is deep, and naming
                 // it inside another future's type is what makes the compiler give up
                 // proving that whole chain `Send` for a caller that spawns it.
                 let layer: LayerFuture<'_> = Box::pin(async move {
-                    let _held = if plan.kind == LayerKind::Pack {
-                        Some(buffered.acquire().await.map_err(|_| abandoned())?)
-                    } else {
-                        None
-                    };
                     let started = Instant::now();
-                    let (reference, sent) = self.upload_layer_counted(plan).await?;
-                    Ok((position, reference, sent, started.elapsed()))
+                    let outcome = self
+                        .upload_layer_counted(plan)
+                        .await
+                        .map(|(reference, sent)| (reference, sent, started.elapsed()));
+                    (position, is_pack, outcome)
                 });
                 running.push(layer);
             }
-            let Some(finished) = running.next().await else {
+            let Some((position, was_pack, outcome)) = running.next().await else {
                 break;
             };
-            match finished {
-                Ok((position, reference, sent, took)) => {
+            packs -= usize::from(was_pack);
+            match outcome {
+                Ok((reference, sent, took)) => {
                     tracing::debug!(
                         layer = position + 1,
                         of = total,
@@ -721,7 +768,7 @@ impl Uploader {
             .lock()
             .await
             .as_ref()
-            .map(|(_, client)| client.clone());
+            .map(|held| held.client.clone());
         if let Some(client) = client {
             client.chunked_abandon(&self.repository, &session).await;
         }

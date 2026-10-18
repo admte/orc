@@ -177,6 +177,11 @@ pub enum RestoreError {
     },
     #[error("app data restore task failed: {0}")]
     Task(String),
+    #[error(
+        "app data index entry {0:?} lands on a file another entry already wrote — two \
+         names this filesystem does not tell apart, such as ones differing only in case"
+    )]
+    Collision(String),
     /// A layer pass stopped because another one failed. Never the error a restore returns:
     /// the failure that caused it is.
     #[error("app data layer pass stopped: another layer failed")]
@@ -640,7 +645,8 @@ impl Restorer {
         // 1. The index, streamed through the sequential decoder into compact records,
         //    then the directories it declares. Files and symlinks are only recorded.
         // Whatever ends this call — an error, or the caller dropping it — stops every
-        // layer pass still reading, rather than leaving it writing into the directory.
+        // layer pass still reading. An error awaits them before it returns; a dropped
+        // call cannot, so a pass may still finish the chunk it is writing.
         let cancel = CancellationToken::new();
         let _stop_on_exit = cancel.clone().drop_guard();
         let index_wire = Arc::new(AtomicU64::new(0));
@@ -1226,7 +1232,22 @@ fn create_in_place(
         }
         verified.insert(parent);
     }
-    Ok(std::fs::File::create(&path)?)
+    // Never truncate. The restore root starts empty and the index names every path once,
+    // so a file that is already there is a second index path landing on the same file —
+    // which a case-insensitive filesystem makes of `Data/a` and `data/a`. With layers
+    // written in parallel the two would interleave into one corrupt file; refusing it is
+    // the loud failure the module promises.
+    match std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(RestoreError::Collision(relative.to_owned()))
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Joins a path from the index onto `root`, refusing anything that could land outside it.
