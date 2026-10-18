@@ -504,10 +504,12 @@ async fn a_capture_uploads_its_layers_four_at_a_time() {
         sequential_took >= trip * u32::try_from(LAYERS).expect("layers"),
         "sequential is one layer after another: {sequential_took:?}"
     );
-    // ceil(8 / 4) = 2 layers' worth of round trips, plus room for the work itself on a
-    // slow runner — and in any case well under half the sequential time.
+    // ceil(8 / 4) = 2 layers' worth of round trips rather than 8 — about a quarter of the
+    // sequential time locally. Asserted at half, which a slow runner's per-request
+    // overhead (Windows loopback adds tens of milliseconds) still clears; the peak below
+    // is the exact check on how many are in flight.
     assert!(
-        parallel_took < trip * 4 && parallel_took * 2 < sequential_took,
+        parallel_took * 2 < sequential_took,
         "four at a time is about two layers' worth of round trips: {parallel_took:?}"
     );
     let peak = four.peak.load(Ordering::SeqCst);
@@ -589,10 +591,10 @@ async fn a_restore_fetches_its_layers_four_at_a_time() {
     // The index, then one GET per layer.
     let layers = u32::try_from(LAYERS).expect("layers");
     assert!(sequential_took >= LATENCY * (1 + layers));
-    // The index, then ceil(8 / 4) = 2 rounds of four, plus room for the work itself on a
-    // slow runner — and in any case well under half the sequential time.
+    // The index, then ceil(8 / 4) = 2 rounds of four rather than 8 — about a third of the
+    // sequential time locally. Asserted at half, for the same reason as the capture's.
     assert!(
-        parallel_took < LATENCY * (1 + 2 + 3) && parallel_took * 2 < sequential_took,
+        parallel_took * 2 < sequential_took,
         "four at a time is about two rounds: {parallel_took:?}"
     );
 
@@ -766,14 +768,6 @@ async fn a_capture_cut_short_resumes_without_resending_finished_layers() {
         )
     };
     assert_eq!(finished.len(), 5);
-    // Last in plan order, but largest: started in the first wave of four, not the second.
-    assert!(
-        first_negotiations[..4]
-            .iter()
-            .any(|(digest, _, _)| !finished.contains(digest)),
-        "the big layer is started first"
-    );
-
     // The next cycle offers the same layers.
     state.set_rules(Rules::default());
     let second = uploader(&addr, &sealer);
@@ -809,4 +803,33 @@ async fn a_capture_cut_short_resumes_without_resending_finished_layers() {
         "only the layer that was cut crosses the wire again"
     );
     assert!(store.deleted.is_empty());
+}
+
+/// Layers start largest first: a big layer a cut cycle left half-sent resumes its session
+/// before a new session is opened beside it, so the registry's per-principal cap never
+/// makes room by abandoning it. One at a time, so the order the registry sees is the
+/// order they were started in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_largest_layer_is_started_first() {
+    let mut sizes = [LAYER_BYTES / 4; 3];
+    sizes[2] = LAYER_BYTES;
+    let tree = tree(&sizes, 6);
+    let state = fake();
+    let addr = serve(state.clone()).await;
+    let references = uploader(&addr, &sealer(6))
+        .upload_layers_with(&tree.plans, 1)
+        .await
+        .expect("upload");
+    let store = state.store.lock().expect("store");
+    let order: Vec<&str> = store
+        .negotiations
+        .iter()
+        .map(|(digest, _, _)| digest.as_str())
+        .collect();
+    assert_eq!(
+        order.first().copied(),
+        Some(references[2].digest.as_str()),
+        "last in plan order, but largest"
+    );
+    assert_eq!(order.len(), 3);
 }
