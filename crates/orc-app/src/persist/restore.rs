@@ -1,4 +1,4 @@
-//! Materializing a restore point: index first, then one sequential pass per layer.
+//! Materializing a restore point: index first, then one forward pass per layer.
 //!
 //! # Shape of the pass
 //!
@@ -12,6 +12,20 @@
 //! A layer is never seeked, never buffered whole, and never re-read: the layer's plaintext
 //! is the concatenation of the files that reference it, in offset order, so one forward
 //! pass fills them all.
+//!
+//! # Layers in parallel
+//!
+//! Up to [`TRANSFER_CONCURRENCY`] layers are fetched at once, each on its own connection
+//! and its own blocking decoder. That is safe because a file lives in exactly one layer:
+//! two passes never write the same file, the directories they write into all exist before
+//! the first one starts, and nothing after the file phase begins until every pass has
+//! ended. Each pass still reads its layer front to back, so decryption, decompression and
+//! the digest check at EOF are what they were. What parallelism costs is one more blob
+//! reader's queue per layer in flight — never a layer held whole.
+//!
+//! The first layer to fail fails the restore: the passes still running are cancelled —
+//! the next read each makes is refused — and awaited before the error is returned, so
+//! nothing is still writing into the directory a caller is about to remove.
 //!
 //! # Where it lands
 //!
@@ -62,14 +76,20 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::CliError;
-use crate::persist::PersistSpec;
 use crate::persist::seal::{KeyRing, Opener, SealError};
 use crate::persist::stream::{StreamError, decode_sealed_sequential};
 use crate::persist::tree::{
     Entry, EntryRef, IndexHeader, IndexWriter, Kind, LayerRef, TreeError, mirror,
 };
+use crate::persist::{PersistSpec, TRANSFER_CONCURRENCY, bytes_per_second};
 use crate::registry::RegistryClient;
 
 /// Entries one restore point may carry. A tree past this is beyond what the format is
@@ -157,6 +177,10 @@ pub enum RestoreError {
     },
     #[error("app data restore task failed: {0}")]
     Task(String),
+    /// A layer pass stopped because another one failed. Never the error a restore returns:
+    /// the failure that caused it is.
+    #[error("app data layer pass stopped: another layer failed")]
+    Cancelled,
 }
 
 /// Names the layer an authentication failure happened on, and says what a person can do
@@ -223,14 +247,29 @@ pub struct RestorePoint {
     pub bytes: u64,
 }
 
-/// What a restore actually put on disk.
+/// What a restore actually put on disk, and what it cost to get it there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RestoreStats {
     pub files: u64,
     pub dirs: u64,
     pub symlinks: u64,
+    /// Plaintext bytes written into files: the size of the data, not of the transfer.
     pub bytes: u64,
+    /// Data layers read; the index is not counted.
     pub layers: usize,
+    /// Bytes read off the registry — the index and every layer, sealed and compressed as
+    /// they are stored. What the restore cost on the wire.
+    pub wire_bytes: u64,
+    /// From the first request to the last byte and mode placed.
+    pub elapsed: Duration,
+}
+
+impl RestoreStats {
+    /// [`Self::wire_bytes`] over [`Self::elapsed`], in bytes per second.
+    #[must_use]
+    pub fn wire_rate(&self) -> u64 {
+        bytes_per_second(self.wire_bytes, self.elapsed)
+    }
 }
 
 /// One file's place in the point, in the compact form the restore holds a million of.
@@ -368,6 +407,8 @@ impl PointIndex {
             symlinks: self.symlinks.len() as u64,
             bytes: 0,
             layers: 0,
+            wire_bytes: 0,
+            elapsed: Duration::ZERO,
         }
     }
 
@@ -514,7 +555,8 @@ impl RestoredPoint {
 pub trait LayerObserver: Send + Sync {
     /// Called just before layer `number` of `total` is fetched, both 1-based over the
     /// layers this pass will actually read (a listed layer nothing references is skipped
-    /// and not counted). `bytes` is the plaintext written by the layers before it.
+    /// and not counted). Layers start in order, though several may be in flight at once;
+    /// `bytes` is the plaintext written by the layers that have finished so far.
     fn layer(&self, number: usize, total: usize, bytes: u64);
 }
 
@@ -555,6 +597,36 @@ impl Restorer {
         dest_parent: &Path,
         observer: Option<&dyn LayerObserver>,
     ) -> Result<RestoredPoint, RestoreError> {
+        Self::materialize_with(
+            client,
+            repository,
+            ring,
+            point,
+            dest_parent,
+            observer,
+            TRANSFER_CONCURRENCY,
+        )
+        .await
+    }
+
+    /// [`Self::materialize_observed`], fetching up to `concurrency` layers at once (at
+    /// least one). See the module docs for why that is safe.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::materialize`]. The first layer to fail is the error returned; the
+    /// others are cancelled and awaited first.
+    #[allow(clippy::too_many_lines)] // The phases read in order; splitting them hides it.
+    pub async fn materialize_with(
+        client: &RegistryClient,
+        repository: &str,
+        ring: &KeyRing,
+        point: &RestorePoint,
+        dest_parent: &Path,
+        observer: Option<&dyn LayerObserver>,
+        concurrency: usize,
+    ) -> Result<RestoredPoint, RestoreError> {
+        let started = Instant::now();
         // The point names the key it was sealed under, which is the right one to try
         // first — but layers it carried forward from an earlier point were sealed under
         // whatever key the pool held then, so the whole ring travels with it.
@@ -567,14 +639,24 @@ impl Restorer {
 
         // 1. The index, streamed through the sequential decoder into compact records,
         //    then the directories it declares. Files and symlinks are only recorded.
-        let reader = client
-            .get_blob_reader(repository, &point.index.digest)
-            .await?;
+        // Whatever ends this call — an error, or the caller dropping it — stops every
+        // layer pass still reading, rather than leaving it writing into the directory.
+        let cancel = CancellationToken::new();
+        let _stop_on_exit = cancel.clone().drop_guard();
+        let index_wire = Arc::new(AtomicU64::new(0));
+        let reader = Metered {
+            inner: client
+                .get_blob_reader_until(repository, &point.index.digest, cancel.clone())
+                .await?,
+            read: Arc::clone(&index_wire),
+            cancel: cancel.clone(),
+        };
         let index_ring = Arc::clone(&ring);
         let index = tokio::task::spawn_blocking(move || PointIndex::read(reader, &*index_ring))
             .await
             .map_err(|err| RestoreError::Task(err.to_string()))??;
         let mut stats = index.stats();
+        stats.wire_bytes = index_wire.load(Ordering::Relaxed);
         for record in index.dirs() {
             std::fs::create_dir_all(safe_join(&root, record.path)?)?;
         }
@@ -602,37 +684,92 @@ impl Restorer {
                 .push(position);
         }
 
+        // The layers to read, in header order. A listed layer nothing references is
+        // skipped — harmless (a carried layer whose last reference vanished would simply
+        // not be listed) but not worth reading. Only positions are held here; a layer's
+        // paths are copied out when its pass starts, so the queue costs eight bytes a file.
         let total_layers = by_layer.len();
-        for (number, layer) in index.header.layers.iter().enumerate() {
-            let Some(positions) = by_layer.remove(&u32::try_from(number).unwrap_or(u32::MAX))
-            else {
-                // A layer nothing references. Harmless — a carried layer whose last
-                // reference vanished would simply not be listed — but not worth reading.
-                continue;
-            };
-            let position_in_pass = stats.layers + 1;
-            if let Some(observer) = observer {
-                observer.layer(position_in_pass, total_layers, stats.bytes);
-            }
-            let plan: Vec<(FileRecord, String)> = positions
-                .iter()
-                .map(|position| {
-                    let record = index.files[*position];
-                    (record, index.path_of(&record).to_owned())
-                })
-                .collect();
-            let reader = client.get_blob_reader(repository, &layer.digest).await?;
-            let layer_root = root.clone();
-            let layer_ring = Arc::clone(&ring);
-            let digest = layer.digest.clone();
-            let written = tokio::task::spawn_blocking(move || {
-                scatter_layer(reader, &*layer_ring, &layer_root, &digest, &plan)
+        let mut queue = index
+            .header
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(number, layer)| {
+                by_layer
+                    .remove(&u32::try_from(number).unwrap_or(u32::MAX))
+                    .map(|positions| (layer, positions))
             })
-            .await
-            .map_err(|err| RestoreError::Task(err.to_string()))?
-            .map_err(|err| name_the_layer(err, position_in_pass, total_layers, &layer.digest))?;
-            stats.bytes += written;
-            stats.layers += 1;
+            .enumerate()
+            .map(|(position, (layer, positions))| (position + 1, layer, positions));
+        let mut running = FuturesUnordered::new();
+        let mut failure: Option<RestoreError> = None;
+        loop {
+            while failure.is_none() && running.len() < concurrency.max(1) {
+                let Some((position_in_pass, layer, positions)) = queue.next() else {
+                    break;
+                };
+                if let Some(observer) = observer {
+                    observer.layer(position_in_pass, total_layers, stats.bytes);
+                }
+                let plan: Vec<(FileRecord, String)> = positions
+                    .iter()
+                    .map(|position| {
+                        let record = index.files[*position];
+                        (record, index.path_of(&record).to_owned())
+                    })
+                    .collect();
+                let pass = LayerPass {
+                    client,
+                    repository,
+                    ring: Arc::clone(&ring),
+                    root: root.clone(),
+                    digest: layer.digest.clone(),
+                    plan,
+                    cancel: cancel.clone(),
+                };
+                running.push(async move {
+                    pass.run()
+                        .await
+                        .map_err(|err| {
+                            name_the_layer(err, position_in_pass, total_layers, &layer.digest)
+                        })
+                        .map(|done| (position_in_pass, layer, done))
+                });
+            }
+            let Some(finished) = running.next().await else {
+                break;
+            };
+            match finished {
+                Ok((position_in_pass, layer, done)) => {
+                    stats.bytes += done.written;
+                    stats.wire_bytes += done.wire;
+                    stats.layers += 1;
+                    tracing::debug!(
+                        layer = position_in_pass,
+                        of = total_layers,
+                        digest = %layer.digest,
+                        wire_bytes = done.wire,
+                        bytes = done.written,
+                        took_ms = u64::try_from(done.took.as_millis()).unwrap_or(u64::MAX),
+                        rate_bps = bytes_per_second(done.wire, done.took),
+                        "app data: restore layer fetched and written"
+                    );
+                }
+                Err(err) => {
+                    if failure.is_none() {
+                        // Stop the others: each refuses its next read, and is awaited
+                        // here before the first failure is handed back.
+                        cancel.cancel();
+                        failure = Some(err);
+                    }
+                }
+            }
+        }
+        // Both borrow the index, which is handed back below.
+        drop(running);
+        drop(queue);
+        if let Some(failure) = failure {
+            return Err(failure);
         }
 
         // 3. Every file's mode and time, while there is still no symlink anywhere under
@@ -664,7 +801,94 @@ impl Restorer {
             apply_metadata(&path, record.mtime_ns, record.mode);
         }
 
+        stats.elapsed = started.elapsed();
+        tracing::debug!(
+            files = stats.files,
+            layers = stats.layers,
+            bytes = stats.bytes,
+            wire_bytes = stats.wire_bytes,
+            took_ms = u64::try_from(stats.elapsed.as_millis()).unwrap_or(u64::MAX),
+            rate_bps = stats.wire_rate(),
+            concurrency = concurrency.max(1),
+            "app data: restore point materialized"
+        );
         Ok(RestoredPoint { root, stats, index })
+    }
+}
+
+/// One layer's pass: fetch it, decode it front to back, scatter it into its files.
+struct LayerPass<'a> {
+    client: &'a RegistryClient,
+    repository: &'a str,
+    ring: Arc<KeyRing>,
+    root: PathBuf,
+    digest: String,
+    plan: Vec<(FileRecord, String)>,
+    cancel: CancellationToken,
+}
+
+/// What one layer's pass did.
+struct LayerDone {
+    /// Plaintext written into files.
+    written: u64,
+    /// Bytes read off the registry for the layer.
+    wire: u64,
+    /// From the request to the last byte written.
+    took: Duration,
+}
+
+impl LayerPass<'_> {
+    async fn run(self) -> Result<LayerDone, RestoreError> {
+        let started = Instant::now();
+        let reader = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => return Err(RestoreError::Cancelled),
+            reader = self.client.get_blob_reader_until(
+                self.repository,
+                &self.digest,
+                self.cancel.clone(),
+            ) => reader?,
+        };
+        let wire = Arc::new(AtomicU64::new(0));
+        let reader = Metered {
+            inner: reader,
+            read: Arc::clone(&wire),
+            cancel: self.cancel,
+        };
+        let (ring, root, digest, plan) = (self.ring, self.root, self.digest, self.plan);
+        let written = tokio::task::spawn_blocking(move || {
+            scatter_layer(reader, &*ring, &root, &digest, &plan)
+        })
+        .await
+        .map_err(|err| RestoreError::Task(err.to_string()))??;
+        Ok(LayerDone {
+            written,
+            wire: wire.load(Ordering::Relaxed),
+            took: started.elapsed(),
+        })
+    }
+}
+
+/// A blob reader that counts what it hands out and stops when told to.
+///
+/// The count is the layer's wire size once the decoder has read to EOF — which it must,
+/// for the digest check there to run. The cancellation is how a failed layer stops its
+/// siblings: their blocking decoders cannot be interrupted any other way, and the next
+/// read each makes is refused.
+struct Metered<R> {
+    inner: R,
+    read: Arc<AtomicU64>,
+    cancel: CancellationToken,
+}
+
+impl<R: std::io::Read> std::io::Read for Metered<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::other(RestoreError::Cancelled.to_string()));
+        }
+        let read = self.inner.read(buf)?;
+        self.read.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
     }
 }
 

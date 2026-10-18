@@ -382,6 +382,27 @@ impl RegistryClient {
     /// The returned reader blocks. Call it from [`tokio::task::spawn_blocking`] — reading
     /// it on a runtime worker thread panics, exactly as any other blocking receive does.
     pub async fn get_blob_reader(&self, repository: &str, digest: &str) -> Result<BlobReader> {
+        self.get_blob_reader_until(
+            repository,
+            digest,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// [`get_blob_reader`](Self::get_blob_reader), with a download that stops once
+    /// `cancel` is cut.
+    ///
+    /// A reader blocked waiting for the network cannot be woken any other way: when the
+    /// token is cut the download stops, the reader's next receive reports the stop as an
+    /// error, and the connection is closed — which is how a restore that has already
+    /// failed on one layer stops the others it is reading in parallel.
+    pub async fn get_blob_reader_until(
+        &self,
+        repository: &str,
+        digest: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<BlobReader> {
         use futures_util::StreamExt as _;
 
         let path = format!("/v2/{repository}/blobs/{digest}");
@@ -407,7 +428,20 @@ impl RegistryClient {
         let (sender, receiver) = tokio::sync::mpsc::channel(BLOB_READER_QUEUE);
         tokio::spawn(async move {
             let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
+            loop {
+                let chunk = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        // Best effort: on a full queue the channel still closes, which the
+                        // reader reports as a digest mismatch — an error either way.
+                        let _ = sender.try_send(Err(format!("read registry blob {path}: stopped")));
+                        return;
+                    }
+                    chunk = stream.next() => chunk,
+                };
+                let Some(chunk) = chunk else {
+                    return;
+                };
                 let message = match chunk {
                     Ok(bytes) => Ok(bytes.to_vec()),
                     Err(err) => Err(format!("read registry blob {path}: {err}")),

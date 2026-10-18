@@ -94,16 +94,36 @@
 //! acknowledged ones included, and only what goes past the layer's best so far is credited
 //! (see [`LayerProgress`]). The counter only ever moves forward, which is the one property
 //! the watchdog reads.
+//!
+//! # Layers in parallel
+//!
+//! [`Uploader::upload_layers`] runs up to [`TRANSFER_CONCURRENCY`] layer ladders at once,
+//! each over its own connection: on a high-latency path a single stream spends most of its
+//! time waiting, and the layers of one capture are independent until the commit. Two
+//! things stay as they were. Nothing is committed until every layer is stored — the call
+//! returns the references only when all of them are. And at most
+//! [`BUFFERED_LAYERS_IN_FLIGHT`] pack layers are sealed into memory at a time, so the
+//! parallelism multiplies connections, not the ~68 MiB a pack is held in.
+//!
+//! The first layer to fail fails the call, and spends the uploader: it is cancelled, as a
+//! cut would cancel it, so the other ladders stop and **keep** their sessions — the next
+//! cycle resumes them like any cut one — and every one of them is awaited before the
+//! error is returned, so no encoder is still reading the frozen view.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 
 use crate::error::{CliError, Result};
 use crate::persist::pack::{LayerKind, LayerPlan, PlannedFile};
 use crate::persist::seal::Sealer;
 use crate::persist::stream::{SealedLayer, encode_sealed_stream};
 use crate::persist::tree::LayerRef;
+use crate::persist::{TRANSFER_CONCURRENCY, bytes_per_second};
 use crate::registry::{ChunkedResume, RegistryClient, sealed_recipe_body};
 use tokio_util::sync::CancellationToken;
 
@@ -155,6 +175,22 @@ const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// Re-negotiations before an upload is declared stuck. Matches the image path's budget.
 const MAX_RESUME: usize = 3;
+
+/// One layer's upload inside [`Uploader::upload_layers_with`]: its plan position, its
+/// reference, the frame bytes it sent, and how long it took.
+type LayerFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<(usize, LayerRef, u64, std::time::Duration)>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Pack layers sealed into memory at once by [`Uploader::upload_layers`]. A pack is held
+/// whole while it is negotiated (~68 MiB at worst, see
+/// [`crate::persist::pack::PACK_CUT_BYTES`]); a whole-file layer streams and holds two
+/// batches. Two packs bound a capture's peak at about twice what one sequential pass held.
+const BUFFERED_LAYERS_IN_FLIGHT: usize = 2;
 
 /// Supplies bearer credentials for an App-data repository.
 ///
@@ -400,6 +436,11 @@ impl Uploader {
     /// Returns [`CliError`] for a read failure, a sealing failure, or a negotiation that
     /// does not converge. There is no monolithic fallback: see the module docs.
     pub async fn upload_layer(&self, plan: &LayerPlan) -> Result<LayerRef> {
+        Ok(self.upload_layer_counted(plan).await?.0)
+    }
+
+    /// [`upload_layer`](Self::upload_layer), with the frame bytes this layer itself sent.
+    async fn upload_layer_counted(&self, plan: &LayerPlan) -> Result<(LayerRef, u64)> {
         match plan.kind {
             LayerKind::Pack => self.upload_pack(&plan.files).await,
             LayerKind::Whole => {
@@ -409,6 +450,96 @@ impl Uploader {
                 self.upload_whole_file(file).await
             }
         }
+    }
+
+    /// Uploads every planned layer, up to [`TRANSFER_CONCURRENCY`] at once, and returns
+    /// their references in plan order.
+    ///
+    /// # Errors
+    ///
+    /// As [`upload_layer`](Self::upload_layer), for the first layer that fails. See the
+    /// module docs: that failure cancels this uploader, and the other layers are awaited
+    /// before it is returned.
+    pub async fn upload_layers(&self, plans: &[LayerPlan]) -> Result<Vec<LayerRef>> {
+        self.upload_layers_with(plans, TRANSFER_CONCURRENCY).await
+    }
+
+    /// [`upload_layers`](Self::upload_layers), with up to `concurrency` layers in flight
+    /// (at least one).
+    ///
+    /// # Errors
+    ///
+    /// As [`upload_layers`](Self::upload_layers).
+    pub async fn upload_layers_with(
+        &self,
+        plans: &[LayerPlan],
+        concurrency: usize,
+    ) -> Result<Vec<LayerRef>> {
+        let buffered = tokio::sync::Semaphore::new(BUFFERED_LAYERS_IN_FLIGHT);
+        let total = plans.len();
+        let mut stored: Vec<Option<LayerRef>> = vec![None; total];
+        let mut queue = plans.iter().enumerate();
+        let mut running = FuturesUnordered::new();
+        let mut failure: Option<CliError> = None;
+        loop {
+            while failure.is_none() && running.len() < concurrency.max(1) {
+                let Some((position, plan)) = queue.next() else {
+                    break;
+                };
+                let buffered = &buffered;
+                // Boxed as a `Send` trait object: the ladder's future is deep, and naming
+                // it inside another future's type is what makes the compiler give up
+                // proving that whole chain `Send` for a caller that spawns it.
+                let layer: LayerFuture<'_> = Box::pin(async move {
+                    let _held = if plan.kind == LayerKind::Pack {
+                        Some(buffered.acquire().await.map_err(|_| abandoned())?)
+                    } else {
+                        None
+                    };
+                    let started = Instant::now();
+                    let (reference, sent) = self.upload_layer_counted(plan).await?;
+                    Ok((position, reference, sent, started.elapsed()))
+                });
+                running.push(layer);
+            }
+            let Some(finished) = running.next().await else {
+                break;
+            };
+            match finished {
+                Ok((position, reference, sent, took)) => {
+                    tracing::debug!(
+                        layer = position + 1,
+                        of = total,
+                        digest = %reference.digest,
+                        size = reference.size,
+                        sent_bytes = sent,
+                        took_ms = u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
+                        rate_bps = bytes_per_second(sent, took),
+                        "app data: capture layer stored"
+                    );
+                    stored[position] = Some(reference);
+                }
+                Err(err) => {
+                    if failure.is_none() {
+                        // The others stop and keep their sessions for the next cycle;
+                        // each is awaited here, off the frozen view, before this returns.
+                        self.cancel();
+                        failure = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        stored
+            .into_iter()
+            .map(|reference| {
+                reference.ok_or_else(|| {
+                    CliError::Operational("app data: a planned layer was never uploaded".to_owned())
+                })
+            })
+            .collect()
     }
 
     /// Uploads a buffer as a layer of its own — the index layer's path.
@@ -432,11 +563,11 @@ impl Uploader {
         })
         .await
         .map_err(|err| join_error(&err))??;
-        self.push_buffered(&layer, frames).await
+        Ok(self.push_buffered(&layer, frames).await?.0)
     }
 
     /// Seals a run of small files into one layer held in memory, then negotiates it.
-    async fn upload_pack(&self, files: &[PlannedFile]) -> Result<LayerRef> {
+    async fn upload_pack(&self, files: &[PlannedFile]) -> Result<(LayerRef, u64)> {
         let sealer = Arc::clone(&self.sealer);
         let planned = files.to_vec();
         let cancel = self.cancel.clone();
@@ -459,7 +590,11 @@ impl Uploader {
     }
 
     /// Negotiates a layer whose frames are already in memory.
-    async fn push_buffered(&self, layer: &SealedLayer, frames: Vec<Vec<u8>>) -> Result<LayerRef> {
+    async fn push_buffered(
+        &self,
+        layer: &SealedLayer,
+        frames: Vec<Vec<u8>>,
+    ) -> Result<(LayerRef, u64)> {
         let recipe = recipe_bytes(layer)?;
         let mut tally = LayerProgress::default();
         for attempt in 0..2 {
@@ -470,7 +605,7 @@ impl Uploader {
                 .buffered_ladder(layer, &frames, &recipe, &mut tally)
                 .await
             {
-                Ok(()) => return Ok(layer_ref(layer)),
+                Ok(()) => return Ok((layer_ref(layer), tally.sent)),
                 Err(AttemptError::Retry(_)) if attempt == 0 => {}
                 Err(err) => return Err(err.into()),
             }
@@ -669,7 +804,7 @@ impl Uploader {
     }
 
     /// The two-pass path: learn the framing, then re-encode and send only what is missing.
-    async fn upload_whole_file(&self, file: &PlannedFile) -> Result<LayerRef> {
+    async fn upload_whole_file(&self, file: &PlannedFile) -> Result<(LayerRef, u64)> {
         let sealer = Arc::clone(&self.sealer);
         let source = file.source.clone();
         let cancel = self.cancel.clone();
@@ -704,7 +839,7 @@ impl Uploader {
                 .two_pass_ladder(file, &layer, &recipe, &mut tally)
                 .await
             {
-                Ok(()) => return Ok(layer_ref(&layer)),
+                Ok(()) => return Ok((layer_ref(&layer), tally.sent)),
                 Err(AttemptError::Retry(_)) if attempt == 0 => {}
                 Err(err) => return Err(err.into()),
             }
@@ -1077,6 +1212,9 @@ struct LayerProgress {
     best: u64,
     /// What the current attempt has got through: held at negotiation, plus acknowledged.
     attempt: u64,
+    /// Frame bytes `PATCH`ed and acknowledged for this layer, across every attempt — its
+    /// share of [`Uploader::sent_bytes`].
+    sent: u64,
 }
 
 impl LayerProgress {
@@ -1088,6 +1226,7 @@ impl LayerProgress {
 
     /// A `PATCH` acknowledged, carrying `sent` bytes of frames.
     fn acked(&mut self, uploader: &Uploader, sent: u64) {
+        self.sent = self.sent.saturating_add(sent);
         self.attempt = self.attempt.saturating_add(sent);
         self.credit(uploader);
     }

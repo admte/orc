@@ -263,7 +263,8 @@ fn number(annotations: &BTreeMap<String, String>, key: &str) -> Option<u64> {
 /// looks complete and is not. `dest` must not already exist unless `force` is set, in
 /// which case what is there is removed first.
 ///
-/// Every layer is fetched exactly once, in index-header order. There is no per-layer
+/// Every layer is fetched exactly once, several at a time, started in index-header order
+/// (see [`crate::persist::restore`]). There is no per-layer
 /// resume: a point is materialized whole or not at all, because a partial tree carries no
 /// record of which of its files came out of a layer that verified.
 ///
