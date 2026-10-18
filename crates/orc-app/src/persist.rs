@@ -16,6 +16,26 @@ pub mod upload;
 
 pub use self::seal::KeyRing;
 
+/// Layers a restore fetches, or a capture uploads, at the same time.
+///
+/// The registry sits behind whatever path the node has to the server, and on a
+/// high-latency one a single stream spends most of its time waiting for acknowledgements:
+/// at 150-190 ms round trip one TCP stream measured ~3 MB/s on a 10 MB object, while eight
+/// in parallel shared ~22 MB/s. Four is most of that gain at half the connections and
+/// half the memory each in-flight layer holds.
+pub const TRANSFER_CONCURRENCY: usize = 4;
+
+/// `bytes` over `elapsed`, in bytes per second — what a transfer log line reports as its
+/// rate. Zero for no time at all, rather than a division by it.
+#[must_use]
+pub fn bytes_per_second(bytes: u64, elapsed: std::time::Duration) -> u64 {
+    let micros = elapsed.as_micros();
+    if micros == 0 {
+        return 0;
+    }
+    u64::try_from(u128::from(bytes) * 1_000_000 / micros).unwrap_or(u64::MAX)
+}
+
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::app::{AppConfig, PersistBlock};
