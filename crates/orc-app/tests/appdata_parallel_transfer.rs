@@ -67,6 +67,8 @@ struct Fake {
     get_rules: Arc<Mutex<HashMap<String, Rule>>>,
     /// Stalled blob bodies the client has since walked away from.
     abandoned_bodies: Arc<AtomicUsize>,
+    /// `PATCH`es that arrived and are being left unanswered.
+    stalled_patches: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +115,7 @@ fn fake() -> Fake {
         rules: Arc::default(),
         get_rules: Arc::default(),
         abandoned_bodies: Arc::default(),
+        stalled_patches: Arc::default(),
     }
 }
 
@@ -262,7 +265,10 @@ async fn patch(state: &Fake, session: &str, body: &[u8]) -> Response {
     match rule {
         Rule::Serve => {}
         Rule::Refuse => return StatusCode::BAD_REQUEST.into_response(),
-        Rule::Stall => std::future::pending::<()>().await,
+        Rule::Stall => {
+            state.stalled_patches.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
     }
     let mut store = state.store.lock().expect("store");
     let Some((_, chunks)) = store.sessions.get(session).cloned() else {
@@ -750,8 +756,13 @@ async fn a_capture_cut_short_resumes_without_resending_finished_layers() {
         let plans = tree.plans.clone();
         async move { first.upload_layers(&plans).await }
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while state.store.lock().expect("store").blobs.len() < 5 && Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // Cut once the five small layers are stored and the big one is mid-`PATCH` — on a
+    // slow runner its sealing pass can outlast all five.
+    while (state.store.lock().expect("store").blobs.len() < 5
+        || state.stalled_patches.load(Ordering::SeqCst) == 0)
+        && Instant::now() < deadline
+    {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     first.cancel();
