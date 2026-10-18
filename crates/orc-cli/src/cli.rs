@@ -1586,8 +1586,9 @@ fn default_point_dir(point: &orc_app::persist::point::ResolvedPoint) -> PathBuf 
     })
 }
 
-/// One stderr line per layer as the point is read. A restore point can be a very long
-/// silence otherwise: each layer is a whole blob, fetched and decoded before the next.
+/// One stderr line per layer as its download starts. A restore point can be a very long
+/// silence otherwise: each layer is a whole blob. Several are read at once, so a line
+/// means "started", and the running total counts the layers that have finished.
 struct LayerLines {
     quiet: bool,
 }
