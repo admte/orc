@@ -6,20 +6,26 @@ use serde_json::Value;
 use crate::app::{ParamLifetime, ParamProperty, ParamSchema};
 use crate::error::{CliError, Result};
 
+/// Source kinds whose host-filled value is a secret in its own right: a private key, a
+/// CI runner's registration credential.
+const SECRET_SOURCE_KINDS: &[&str] = &["tls.key", "github.runner"];
+
 fn is_implicitly_sensitive(property: &ParamProperty) -> bool {
     property
         .x_source
         .as_ref()
-        .is_some_and(|source| source.kind == "tls.key")
+        .is_some_and(|source| SECRET_SOURCE_KINDS.contains(&source.kind.as_str()))
 }
 
 fn is_file_backed(property: &ParamProperty) -> bool {
     property.sensitive
         || property.content_media_type.is_some()
-        || property
-            .x_source
-            .as_ref()
-            .is_some_and(|source| matches!(source.kind.as_str(), "tls.key" | "peers.all"))
+        || property.x_source.as_ref().is_some_and(|source| {
+            matches!(
+                source.kind.as_str(),
+                "tls.key" | "github.runner" | "peers.all"
+            )
+        })
 }
 
 fn is_sensitive(property: &ParamProperty) -> bool {
@@ -74,12 +80,18 @@ pub fn parsed_assignment_params(
         .iter()
         .map(|(name, value)| {
             let property = schema.and_then(|schema| schema.properties.get(name));
-            let tls_key_source = property
+            let source_kind = property
                 .and_then(|property| property.x_source.as_ref())
-                .is_some_and(|source| source.kind == "tls.key");
-            let sensitive = property.is_some_and(|property| property.sensitive) || tls_key_source;
+                .map(|source| source.kind.as_str());
+            let tls_key_source = source_kind == Some("tls.key");
+            // A `github.runner` param holds either the operator's own token, tokenized to a
+            // `sec:` reference at configure time, or the credential the host minted for this
+            // node, which arrives as plain content. Only the former is a reference.
+            let host_minted = source_kind == Some("github.runner") && !value.starts_with("sec:");
+            let sensitive = property.is_some_and(|property| property.sensitive)
+                || property.is_some_and(is_implicitly_sensitive);
             let file_backed = property.is_some_and(is_file_backed) || sensitive;
-            let value = if sensitive && !tls_key_source {
+            let value = if sensitive && !tls_key_source && !host_minted {
                 ParsedParamValue::SecretRef(value.clone())
             } else {
                 ParsedParamValue::String(value.clone())
@@ -602,6 +614,37 @@ mod tests {
         assert_eq!(parsed["greeting"].lifetime, ParamLifetime::Runtime);
         // And the schema can shorten a non-secret file param's availability.
         assert_eq!(parsed["eager_note"].lifetime, ParamLifetime::Startup);
+    }
+
+    #[test]
+    fn github_runner_param_is_a_reference_only_when_the_operator_set_it() {
+        let schema = schema(
+            r#"{
+            "properties": {
+                "token": {"type": "string", "sensitive": true, "x-source": {"kind": "github.runner", "params": {"url": "url"}}}
+            }
+        }"#,
+        );
+        // The operator's own token was tokenized at configure time: a secret reference.
+        let operator = BTreeMap::from([("token".to_owned(), "sec:pool:p_1:1:s_1".to_owned())]);
+        let parsed = parsed_assignment_params(&operator, Some(&schema));
+        assert_eq!(
+            parsed["token"].value,
+            ParsedParamValue::SecretRef("sec:pool:p_1:1:s_1".to_owned())
+        );
+        assert!(parsed["token"].file_backed);
+
+        // The credential the host minted for this node arrives as content, still file-backed.
+        let minted = BTreeMap::from([(
+            "token".to_owned(),
+            r#"{"mode":"persistent","token":"AAA"}"#.to_owned(),
+        )]);
+        let parsed = parsed_assignment_params(&minted, Some(&schema));
+        assert_eq!(
+            parsed["token"].value,
+            ParsedParamValue::String(r#"{"mode":"persistent","token":"AAA"}"#.to_owned())
+        );
+        assert!(parsed["token"].file_backed);
     }
 
     fn schema(body: &str) -> ParamSchema {

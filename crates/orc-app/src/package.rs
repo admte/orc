@@ -78,6 +78,7 @@ const VALID_X_SOURCE_KINDS: &[&str] = &[
     "ca.bundle",
     "tls.cert",
     "tls.key",
+    "github.runner",
 ];
 const ENDPOINT_PROTOCOLS: &[&str] = &["tcp", "udp", "http", "https"];
 /// Serve modes an endpoint may declare (spec 180). `role` is reserved for a later
@@ -1242,7 +1243,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         std::fs::write(
             dir.path().join("app.config.v1.json"),
-            r#"{"params":{"type":"object","properties":{"peers":{"type":"string","x-source":{"kind":"peers.all"}},"ca":{"type":"string","x-source":{"kind":"ca.bundle"}}}}}"#,
+            r#"{"params":{"type":"object","properties":{"peers":{"type":"string","x-source":{"kind":"peers.all"}},"ca":{"type":"string","x-source":{"kind":"ca.bundle"}},"token":{"type":"string","sensitive":true,"x-source":{"kind":"github.runner","params":{"url":"url"}}}}}}"#,
         )
         .expect("config");
         plan_directory_push(dir.path()).expect("valid x-source");
