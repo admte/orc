@@ -185,6 +185,110 @@ fn rebuild_overwrites_stale_cached_ref() {
     );
 }
 
+const UNKNOWN_KIND_RECIPE: &str = "
+artifactType: application/vnd.orc8r.app.v1
+annotations:
+  org.opencontainers.image.title: future
+config:
+  params:
+    type: object
+    properties:
+      token:
+        type: string
+        sensitive: true
+        x-source:
+          kind: some.future
+          params:
+            url: url
+      pool:
+        type: string
+        x-source:
+          kind: pool.name
+files:
+  - README.md
+platforms:
+  - os: linux
+    arch: amd64
+  - os: linux
+    arch: arm64
+  - os: windows
+    arch: amd64
+";
+
+#[test]
+fn build_warns_once_about_an_unknown_source_kind_and_keeps_the_recipe_verbatim() {
+    let package = tempfile::tempdir().expect("package");
+    let cache = tempfile::tempdir().expect("cache");
+    std::fs::write(package.path().join("README.md"), "hello\n").expect("payload");
+    std::fs::write(package.path().join("artifact.yaml"), UNKNOWN_KIND_RECIPE).expect("recipe");
+
+    let output = run_orc(
+        &cache,
+        &[
+            "--quiet",
+            "build",
+            package.path().to_str().expect("package"),
+            "-t",
+            "localhost:5000/acme/future:1.0",
+        ],
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = "warning: param `token`: source kind `some.future` is not known to this orc; \
+                   the server decides whether it accepts it";
+    assert_eq!(
+        stderr.matches(warning).count(),
+        1,
+        "one warning across three platforms: {stderr}"
+    );
+    assert!(!stderr.contains("pool.name"), "{stderr}");
+
+    let digest = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let recipe = find_recipe_manifest(cache.path());
+    assert_eq!(recipe["subject"]["digest"], digest);
+    let layer_digest = recipe["layers"][0]["digest"]
+        .as_str()
+        .expect("layer digest");
+    assert_eq!(
+        read_blob(cache.path(), layer_digest),
+        UNKNOWN_KIND_RECIPE.as_bytes(),
+        "recipe blob is byte-identical to artifact.yaml"
+    );
+}
+
+#[test]
+fn build_still_refuses_a_malformed_x_source() {
+    for (case, x_source) in [
+        ("no kind", "x-source:\n          params: {}"),
+        ("not an object", "x-source: some.future"),
+        (
+            "a non-string source param",
+            "x-source:\n          kind: pool.name\n          params:\n            url: [1]",
+        ),
+    ] {
+        let package = tempfile::tempdir().expect("package");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(package.path().join("README.md"), "hello\n").expect("payload");
+        let recipe = format!(
+            "artifactType: application/vnd.orc8r.app.v1\n\
+             annotations:\n  org.opencontainers.image.title: broken\n\
+             config:\n  params:\n    type: object\n    properties:\n      token:\n        \
+             type: string\n        {x_source}\n\
+             files:\n  - README.md\n"
+        );
+        std::fs::write(package.path().join("artifact.yaml"), recipe).expect("recipe");
+
+        let output = run_orc(
+            &cache,
+            &["build", package.path().to_str().expect("package")],
+        );
+        assert!(!output.status.success(), "{case}: build should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("invalid app config"), "{case}: {stderr}");
+        assert_eq!(count_files(cache.path().join("refs")), 0, "{case}");
+    }
+}
+
 fn run_orc(cache: &tempfile::TempDir, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_orc"))
         .args(args)

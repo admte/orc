@@ -300,6 +300,65 @@ async fn push_defaults_to_whole_blob_and_pull_materializes() {
 }
 
 /// A deterministic, highly compressible payload above the 8 MiB chunk floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_publishes_an_unknown_source_kind_with_a_warning() {
+    // A CLI older than the server must not refuse a source kind the server added since:
+    // it warns, publishes the config byte for byte, and the server decides.
+    let package = tempfile::tempdir().expect("package dir");
+    let config = br#"{"params":{"type":"object","properties":{"token":{"type":"string","x-source":{"kind":"some.future"}}}}}"#;
+    std::fs::write(package.path().join("app.config.v1.json"), config).expect("config");
+    std::fs::write(package.path().join("payload.txt"), "hello\n").expect("payload");
+    let push_server = PushMockServer::start("push-token", BTreeSet::new()).await;
+    let config_dir = push_config_dir(&push_server.registry());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orc"))
+        .current_dir(package.path())
+        .args([
+            "--quiet",
+            "push",
+            &format!("{}/acme/future:1.0", push_server.registry()),
+            "app.config.v1.json",
+            "payload.txt",
+        ])
+        .env("ORC_CONFIG_DIR", config_dir.path())
+        .output()
+        .expect("run push");
+    assert_success(&output);
+    assert_stderr_contains(
+        &output,
+        "warning: param `token`: source kind `some.future` is not known to this orc; \
+         the server decides whether it accepts it",
+    );
+    assert_eq!(
+        push_server.uploaded_blobs().get(&digest_bytes(config)),
+        Some(&config.to_vec()),
+        "the config blob is published unchanged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_still_refuses_a_malformed_x_source() {
+    let package = tempfile::tempdir().expect("package dir");
+    let config = br#"{"params":{"type":"object","properties":{"token":{"type":"string","x-source":{"params":{}}}}}}"#;
+    std::fs::write(package.path().join("app.config.v1.json"), config).expect("config");
+    let push_server = PushMockServer::start("push-token", BTreeSet::new()).await;
+    let config_dir = push_config_dir(&push_server.registry());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_orc"))
+        .current_dir(package.path())
+        .args([
+            "push",
+            &format!("{}/acme/broken:1.0", push_server.registry()),
+            "app.config.v1.json",
+        ])
+        .env("ORC_CONFIG_DIR", config_dir.path())
+        .output()
+        .expect("run push");
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert_stderr_contains(&output, "x-source must declare kind");
+    assert!(push_server.manifests().is_empty());
+}
+
 fn chunkable_payload() -> Vec<u8> {
     let mut out = String::with_capacity(10 * 1024 * 1024 + 128);
     let mut i = 0u64;

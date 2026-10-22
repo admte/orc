@@ -33,6 +33,8 @@ pub struct PackageOptions {
     pub explicit_format: bool,
     pub zstd_level: i32,
     pub no_compress: bool,
+    /// What a param `x-source` kind outside this build's vocabulary does to the plan.
+    pub unknown_source_kinds: UnknownSourceKinds,
 }
 
 impl Default for PackageOptions {
@@ -42,8 +44,23 @@ impl Default for PackageOptions {
             explicit_format: false,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             no_compress: false,
+            unknown_source_kinds: UnknownSourceKinds::Refuse,
         }
     }
+}
+
+/// How the authoring contract treats a param `x-source` kind this build does not know.
+///
+/// Only the kind's name is in question: a malformed `x-source` (not an object, no
+/// `kind`, a non-string param) is refused under either policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnknownSourceKinds {
+    /// Refuse the config. What [`validate_app_config`] and the default options do.
+    #[default]
+    Refuse,
+    /// Accept the config and report the kind as a warning. For a CLI that may be older
+    /// than the server it publishes to: the server decides whether it knows the kind.
+    Warn,
 }
 
 impl PackageOptions {
@@ -100,6 +117,9 @@ pub struct PackagePlan {
     pub payloads: Vec<PayloadPlan>,
     pub manifest_bytes: Vec<u8>,
     pub manifest_digest: String,
+    /// Authoring-contract findings that did not stop the plan, in the words to show the
+    /// author (see [`UnknownSourceKinds::Warn`]).
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,7 +268,7 @@ fn build_plan(entries: &[InputEntry], options: PackageOptions) -> Result<Package
     let config_bytes = std::fs::read(&config_entry.path).map_err(|err| {
         CliError::Operational(format!("read {}: {err}", config_entry.path.display()))
     })?;
-    validate_app_config(&config_bytes)?;
+    let warnings = check_app_config(&config_bytes, options.unknown_source_kinds)?;
 
     let annotations = read_annotations(entries)?;
     let mut seen_titles = BTreeSet::new();
@@ -284,6 +304,7 @@ fn build_plan(entries: &[InputEntry], options: PackageOptions) -> Result<Package
         payloads,
         manifest_bytes,
         manifest_digest,
+        warnings,
     })
 }
 
@@ -432,11 +453,42 @@ fn read_annotations(entries: &[InputEntry]) -> Result<BTreeMap<String, String>> 
 ///
 /// Returns [`CliError::Usage`] when the blob is not JSON or violates a contract rule.
 pub fn validate_app_config(body: &[u8]) -> Result<()> {
+    check_app_config(body, UnknownSourceKinds::Refuse).map(drop)
+}
+
+/// [`validate_app_config`] with the unknown-source-kind policy chosen by the caller.
+/// Returns the warnings the config earned under that policy (none under
+/// [`UnknownSourceKinds::Refuse`]).
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] when the blob is not JSON or violates a contract rule.
+pub fn check_app_config(
+    body: &[u8],
+    unknown_source_kinds: UnknownSourceKinds,
+) -> Result<Vec<String>> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|err| CliError::Usage(format!("parse config JSON: {err}")))?;
     validate_endpoints(&value)?;
-    validate_params(&value)?;
-    validate_persist_contract(&value)
+    let mut warnings = Vec::new();
+    validate_params(&value, unknown_source_kinds, &mut warnings)?;
+    validate_persist_contract(&value)?;
+    Ok(warnings)
+}
+
+/// Whether this build of orc knows `kind` as a param `x-source` kind.
+#[must_use]
+pub fn is_known_source_kind(kind: &str) -> bool {
+    VALID_X_SOURCE_KINDS.contains(&kind)
+}
+
+/// The warning shown for param `param` naming a source kind this build does not know.
+#[must_use]
+pub fn unknown_source_kind_warning(param: &str, kind: &str) -> String {
+    format!(
+        "param `{param}`: source kind `{kind}` is not known to this orc; \
+         the server decides whether it accepts it"
+    )
 }
 
 /// The part of the contract a registry enforces on ingest: the config is a JSON
@@ -736,7 +788,11 @@ fn is_duration(value: &str) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-fn validate_params(value: &Value) -> Result<()> {
+fn validate_params(
+    value: &Value,
+    unknown_source_kinds: UnknownSourceKinds,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
     let Some(params) = value.get("params") else {
         return Ok(());
     };
@@ -851,10 +907,17 @@ fn validate_params(value: &Value) -> Result<()> {
                     "params property {name:?} x-source must declare kind"
                 )));
             };
-            if !VALID_X_SOURCE_KINDS.contains(&kind) {
-                return Err(CliError::Usage(format!(
-                    "params property {name:?} x-source kind {kind:?} is not supported"
-                )));
+            if !is_known_source_kind(kind) {
+                match unknown_source_kinds {
+                    UnknownSourceKinds::Refuse => {
+                        return Err(CliError::Usage(format!(
+                            "params property {name:?} x-source kind {kind:?} is not supported"
+                        )));
+                    }
+                    UnknownSourceKinds::Warn => {
+                        warnings.push(unknown_source_kind_warning(name, kind));
+                    }
+                }
             }
             if let Some(params) = x_source.get("params") {
                 let params = params.as_object().ok_or_else(|| {
@@ -1088,6 +1151,7 @@ mod tests {
                 explicit_format: false,
                 zstd_level,
                 no_compress,
+                ..PackageOptions::default()
             };
             let plan = plan_push(dir.path(), &[], options).expect("plan");
             assert_eq!(plan.artifact_type, DOWNLOAD_ARTIFACT_TYPE);
@@ -1700,5 +1764,84 @@ mod tests {
         .expect("config");
         let err = plan_directory_push(dir.path()).expect_err("bad x-source kind");
         assert!(err.to_string().contains("x-source kind"));
+    }
+
+    const UNKNOWN_KIND_CONFIG: &str = r#"{"params":{"type":"object","properties":{"token":{"type":"string","sensitive":true,"x-source":{"kind":"github.runner.next","params":{"url":"url"}}},"pool":{"type":"string","x-source":{"kind":"pool.name"}}}}}"#;
+
+    #[test]
+    fn the_default_contract_still_refuses_an_unknown_source_kind() {
+        let err = validate_app_config(UNKNOWN_KIND_CONFIG.as_bytes()).expect_err("unknown kind");
+        assert!(
+            err.to_string()
+                .contains(r#"x-source kind "github.runner.next" is not supported"#),
+            "{err}"
+        );
+        assert!(
+            check_app_config(UNKNOWN_KIND_CONFIG.as_bytes(), UnknownSourceKinds::Refuse).is_err()
+        );
+    }
+
+    #[test]
+    fn a_warning_plan_accepts_an_unknown_source_kind_and_names_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("app.config.v1.json"), UNKNOWN_KIND_CONFIG).expect("config");
+        let options = PackageOptions {
+            unknown_source_kinds: UnknownSourceKinds::Warn,
+            ..PackageOptions::default()
+        };
+
+        let plan = plan_push(dir.path(), &[], options).expect("unknown kind warns");
+        assert_eq!(
+            plan.warnings,
+            [
+                "param `token`: source kind `github.runner.next` is not known to this orc; \
+              the server decides whether it accepts it"
+            ]
+        );
+        assert_eq!(plan.config_bytes, UNKNOWN_KIND_CONFIG.as_bytes());
+    }
+
+    #[test]
+    fn known_source_kinds_earn_no_warning() {
+        let config = r#"{"params":{"type":"object","properties":{"token":{"type":"string","x-source":{"kind":"github.runner"}}}}}"#;
+        let warnings =
+            check_app_config(config.as_bytes(), UnknownSourceKinds::Warn).expect("known kind");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_malformed_x_source_is_refused_even_when_unknown_kinds_warn() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "x-source is a string",
+                r#"{"params":{"type":"object","properties":{"t":{"type":"string","x-source":"github.runner"}}}}"#,
+                "x-source must be an object",
+            ),
+            (
+                "x-source has no kind",
+                r#"{"params":{"type":"object","properties":{"t":{"type":"string","x-source":{"params":{}}}}}}"#,
+                "x-source must declare kind",
+            ),
+            (
+                "kind is not a string",
+                r#"{"params":{"type":"object","properties":{"t":{"type":"string","x-source":{"kind":7}}}}}"#,
+                "x-source must declare kind",
+            ),
+            (
+                "a source param is not a string",
+                r#"{"params":{"type":"object","properties":{"t":{"type":"string","x-source":{"kind":"some.future","params":{"url":1}}}}}}"#,
+                "must be a string",
+            ),
+            (
+                "an x-source keyword outside the vocabulary",
+                r#"{"params":{"type":"object","properties":{"t":{"type":"string","x-source":{"kind":"some.future","extra":"x"}}}}}"#,
+                "x-source keyword \"extra\" is not supported",
+            ),
+        ];
+        for (case, config, expected) in cases {
+            let err =
+                check_app_config(config.as_bytes(), UnknownSourceKinds::Warn).expect_err(case);
+            assert!(err.to_string().contains(expected), "{case}: {err}");
+        }
     }
 }
