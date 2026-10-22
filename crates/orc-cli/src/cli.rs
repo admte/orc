@@ -26,7 +26,7 @@ use crate::local_artifact_store::{
 use crate::output::{
     ListRow, OutputFormat, print_cached_refs, print_info, print_list, print_status, print_versions,
 };
-use crate::package::{PackageFormat, PackageOptions, PackagePlan, plan_push};
+use crate::package::{PackageFormat, PackageOptions, PackagePlan, UnknownSourceKinds, plan_push};
 use crate::params::{ParsedParam, ParsedParamValue, durable_param_values, parse_app_params};
 use crate::progress::{self, CliProgress};
 use crate::pull::{
@@ -771,6 +771,7 @@ fn build_package_options(args: &BuildArgs) -> PackageOptions {
         explicit_format: args.format.is_some(),
         zstd_level: args.zstd_level.unwrap_or(DEFAULT_ZSTD_LEVEL),
         no_compress: args.no_compress,
+        unknown_source_kinds: UnknownSourceKinds::Warn,
     }
 }
 
@@ -796,6 +797,7 @@ async fn build(args: BuildArgs, settings: &CliSettings, config: &StoredConfig) -
         progress::as_dyn(reporter.as_ref()),
     )
     .await?;
+    print_warnings(&artifact.warnings);
 
     // Use explicit --tag values, or fall back to the reference derived from the
     // artifact.yaml annotations (org.opencontainers.image.title/.version).
@@ -904,6 +906,7 @@ async fn push(args: PushArgs, settings: &CliSettings, config: &StoredConfig) -> 
     // The packager gets the last word on an unforced choice, so report after planning.
     let capable = registry.chunked_capability().await?.is_some();
     let plan = plan_push(&root, &args.paths, push_package_options(&args, capable))?;
+    print_warnings(&plan.warnings);
     if !settings.quiet {
         report_chosen_format(&plan, capable);
     }
@@ -942,6 +945,17 @@ fn push_package_options(args: &PushArgs, capable: bool) -> PackageOptions {
         explicit_format: args.format.is_some() || args.chunker.is_some(),
         zstd_level: args.zstd_level.unwrap_or(DEFAULT_ZSTD_LEVEL),
         no_compress: args.no_compress,
+        // An author's CLI may be older than the server: a source kind it does not know is
+        // the server's to accept or refuse.
+        unknown_source_kinds: UnknownSourceKinds::Warn,
+    }
+}
+
+/// Authoring findings that did not stop a build or push. Shown under `--quiet` too: quiet
+/// silences progress, not a caveat about what is being published.
+fn print_warnings(warnings: &[String]) {
+    for warning in warnings {
+        eprintln!("warning: {warning}");
     }
 }
 

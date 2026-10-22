@@ -11,7 +11,9 @@ use crate::app::{
 };
 use crate::error::{CliError, Result};
 use crate::local_artifact_store::{CachedDescriptor, OCI_MANIFEST_MEDIA_TYPE, descriptor_for};
-use crate::package::{PackageFormat, PackageOptions};
+use crate::package::{
+    PackageFormat, PackageOptions, is_known_source_kind, unknown_source_kind_warning,
+};
 use crate::registry::digest_bytes;
 use orc_app::chunked::{CHUNK_SIZE_FLOOR, ChunkedEncodeOptions, encode_chunked_layer};
 use orc_app::progress::{ProgressEvent, ProgressKind, ProgressPhase, ProgressReporter};
@@ -29,6 +31,8 @@ pub struct BuildArtifact {
     pub default_reference: Option<String>,
     /// The verbatim `artifact.yaml` attached as an OCI recipe referrer of `root`.
     pub recipe: Option<RecipeReferrer>,
+    /// Findings that did not stop the build, once each however many platforms share them.
+    pub warnings: Vec<String>,
 }
 
 /// The source recipe attached to a package as an `application/vnd.orc8r.recipe.v1`
@@ -162,6 +166,7 @@ pub async fn build_artifact(
     let mut manifests = Vec::new();
     let mut blobs = Vec::new();
     let mut index_entries = Vec::new();
+    let mut warnings = BTreeSet::new();
     for context in contexts {
         let built = build_manifest(
             root,
@@ -172,6 +177,7 @@ pub async fn build_artifact(
             reporter,
         )
         .await?;
+        warnings.extend(built.warnings);
         blobs.extend(built.blobs);
         if let Some(platform) = context.platform.as_ref() {
             index_entries.push(IndexEntry {
@@ -218,6 +224,7 @@ pub async fn build_artifact(
         blobs,
         default_reference,
         recipe: Some(recipe_referrer),
+        warnings: warnings.into_iter().collect(),
     })
 }
 
@@ -285,6 +292,7 @@ fn build_recipe_referrer(
 struct BuiltManifest {
     manifest: ManifestBlob,
     blobs: Vec<Blob>,
+    warnings: Vec<String>,
 }
 
 async fn build_manifest(
@@ -298,7 +306,7 @@ async fn build_manifest(
     let config = interpolate_yaml(&recipe.config, context)?;
     let config_bytes = serde_json::to_vec(&config)
         .map_err(|err| CliError::Operational(format!("encode config JSON: {err}")))?;
-    validate_config(&recipe.artifact_type, &config_bytes)?;
+    let warnings = validate_config(&recipe.artifact_type, &config_bytes)?;
     let config_digest = digest_bytes(&config_bytes);
     let mut blobs = vec![Blob {
         digest: config_digest.clone(),
@@ -388,6 +396,7 @@ async fn build_manifest(
             body,
         },
         blobs,
+        warnings,
     })
 }
 
@@ -631,15 +640,27 @@ fn config_media_type(artifact_type: &str) -> Result<&'static str> {
     }
 }
 
-fn validate_config(artifact_type: &str, body: &[u8]) -> Result<()> {
+/// Checks the config blob and returns the warnings it earned. An app param sourced from a
+/// kind this build does not know is a warning, never a failure: the server the package is
+/// published to may well know it, and it is the one that decides.
+fn validate_config(artifact_type: &str, body: &[u8]) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
     if artifact_type == APP_ARTIFACT_TYPE {
-        serde_json::from_slice::<crate::app::AppConfig>(body)
+        let config = serde_json::from_slice::<crate::app::AppConfig>(body)
             .map_err(|err| CliError::Usage(format!("invalid app config: {err}")))?;
+        let properties = config.params.iter().flat_map(|params| &params.properties);
+        for (name, property) in properties {
+            if let Some(source) = &property.x_source
+                && !is_known_source_kind(&source.kind)
+            {
+                warnings.push(unknown_source_kind_warning(name, &source.kind));
+            }
+        }
     }
     if artifact_type == OS_RECIPE_ARTIFACT_TYPE {
         validate_os_recipe_config(body)?;
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// The os.recipe config blob is the artifact.yaml `config:` map serialized verbatim; it must

@@ -1100,6 +1100,42 @@ config:
         );
     }
 
+    /// This builder seeds the server's builtin packages, so it keeps the strict contract:
+    /// an unknown source kind fails here, where the author's CLI only warns.
+    #[tokio::test]
+    async fn recipe_build_still_refuses_an_unknown_source_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("artifact.yaml"),
+            "artifactType: application/vnd.orc8r.app.v1
+annotations:
+  org.opencontainers.image.title: demo
+config:
+  params:
+    type: object
+    properties:
+      token:
+        type: string
+        x-source:
+          kind: some.future
+",
+        )
+        .expect("write recipe");
+        let err = build_artifact(
+            dir.path(),
+            &[],
+            None,
+            BuildOptions::default(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect_err("unknown source kind");
+        assert!(
+            matches!(&err, CliError::Usage(message) if message.contains(r#"x-source kind "some.future" is not supported"#)),
+            "unexpected error: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn skip_missing_platforms_keeps_url_files() {
         let dir = tempfile::tempdir().expect("tempdir");
