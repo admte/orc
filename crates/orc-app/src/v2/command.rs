@@ -84,9 +84,43 @@ pub fn command_argv(
             template[0]
         )));
     };
+    stays_in_app_dir(&template[0], &program)?;
     let mut argv = vec![program];
     argv.extend(elements.flatten());
     Ok(resolve_program(argv, app_dir, host))
+}
+
+/// Refuses a `./` (or `.\`) program whose substituted path leaves the app directory:
+/// a `..` segment, or a path that is absolute once its `./` is gone. The publish checks
+/// already refuse a run-time token in such a program; this holds even for a config
+/// that never met them. Both separators count, whatever the host.
+fn stays_in_app_dir(template: &str, program: &str) -> Result<()> {
+    let Some(rest) = program
+        .strip_prefix("./")
+        .or_else(|| program.strip_prefix(".\\"))
+    else {
+        return Ok(());
+    };
+    let segments: Vec<&str> = rest.split(['/', '\\']).collect();
+    let absolute =
+        rest.starts_with(['/', '\\']) || segments.first().is_some_and(|first| first.contains(':'));
+    if absolute || segments.contains(&"..") {
+        let tokens = token::tokens(template)
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .map(|found| found.raw)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return Err(CliError::Operational(format!(
+            "lifecycle command's program {template:?} resolves to {program:?}, outside the \
+             app directory (filled by {tokens}); a `./` program names a file the package \
+             carries"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolves the first element of an already substituted argv for `host`.
@@ -221,6 +255,48 @@ mod tests {
         assert_eq!(
             resolve_program(argv(&["other.ps1"]), dir.path(), CommandHost::Windows),
             argv(&["other.ps1"])
+        );
+    }
+
+    /// Defence in depth behind the publish check: a `./` program whose substituted path
+    /// leaves the app directory is refused at run time, naming the element and the token.
+    #[test]
+    fn a_dot_slash_program_never_leaves_the_app_dir() {
+        for host in [CommandHost::Unix, CommandHost::Windows] {
+            for (first, value) in [
+                ("./${tool}", "../../../bin/sh"),
+                ("./bin/${tool}", "../../etc/x"),
+                ("./${tool}", "/bin/sh"),
+                ("./${tool}", "\\Windows\\System32\\cmd.exe"),
+                ("./${tool}", "C:\\Windows\\System32\\cmd.exe"),
+                ("./${tool}", "a\\..\\..\\x"),
+                (".\\${tool}", "..\\x.exe"),
+            ] {
+                let tokens = BTreeMap::from([("tool".to_owned(), value.to_owned())]);
+                let err = command_argv(
+                    &argv(&[first, "-c", "id"]),
+                    &tokens,
+                    Path::new("/srv/app"),
+                    host,
+                )
+                .expect_err(value);
+                let message = err.to_string();
+                assert!(message.contains(&format!("{first:?}")), "{message}");
+                assert!(message.contains("${tool}"), "{message}");
+                assert!(message.contains("outside the app directory"), "{message}");
+            }
+        }
+        // Inside the app dir is fine.
+        let tokens = BTreeMap::from([("tool".to_owned(), "bin/run.sh".to_owned())]);
+        assert_eq!(
+            command_argv(
+                &argv(&["./${tool}"]),
+                &tokens,
+                Path::new("/srv/app"),
+                CommandHost::Unix
+            )
+            .expect("inside"),
+            argv(&["/srv/app/bin/run.sh"])
         );
     }
 

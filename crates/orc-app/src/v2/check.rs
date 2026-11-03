@@ -447,6 +447,7 @@ impl Checker<'_> {
         for (index, element) in argv.iter().enumerate() {
             self.element(names, phase, format!("{place}[{index}]"), element);
         }
+        self.app_dir_program(&format!("{place}[0]"), first);
         if self.target.unix() {
             self.packaged_program(&format!("{place}[0]"), first);
         }
@@ -468,6 +469,28 @@ impl Checker<'_> {
         }
     }
 
+    /// A `./` (or `.\`) program names a file the package carries, so it is checked
+    /// against the package here, and a run-time token could make it name anything at all
+    /// — `../../../bin/sh` included. Build vars are resolved before this check runs, so
+    /// only a run-time token can still be in it.
+    fn app_dir_program(&mut self, place: &str, first: &str) {
+        if !(first.starts_with("./") || first.starts_with(".\\")) {
+            return;
+        }
+        let Ok(tokens) = token::tokens(first) else {
+            return;
+        };
+        for found in tokens {
+            self.refuse(
+                place,
+                Some(first),
+                Some(found.raw),
+                "is a run-time token in a `./` program, which names a packaged file: write \
+                 the file's name, or pass the value as an argument",
+            );
+        }
+    }
+
     /// A Unix `./name` program is a file the package carries, marked executable.
     fn packaged_program(&mut self, place: &str, first: &str) {
         let Some(files) = self.target.files else {
@@ -476,7 +499,7 @@ impl Checker<'_> {
         let Some(relative) = first.strip_prefix("./") else {
             return;
         };
-        // A program assembled at run time cannot be looked up here.
+        // A token in it is refused by `app_dir_program`.
         if first.contains("${") {
             return;
         }
@@ -903,6 +926,46 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// A `./` program names a packaged file, which a run-time token cannot: refused on
+    /// every platform, naming the element and the token.
+    #[test]
+    fn a_run_time_token_in_a_dot_slash_program_is_refused() {
+        let config = serde_json::json!({
+            "params": {"properties": {"tool": {"type": "string"}}},
+            "install": {"command": ["./${tool}", "--x"]}
+        });
+        let found = refusals(config, "linux", &[("run.sh", true)]);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with(
+                "linux/amd64: install.command[0] \"./${tool}\": ${tool} is a run-time token in a \
+                 `./` program"
+            ),
+            "{found:?}"
+        );
+        for (os, first) in [
+            ("windows", "./bin/${tool}.ps1"),
+            ("windows", ".\\${tool}.exe"),
+        ] {
+            let config = serde_json::json!({
+                "params": {"properties": {"tool": {"type": "string"}}},
+                "install": {"command": [first]}
+            });
+            let found = refusals(config, os, &[]);
+            assert_eq!(found.len(), 1, "{first}: {found:#?}");
+            assert!(
+                found[0].contains("${tool} is a run-time token"),
+                "{found:?}"
+            );
+        }
+        // A bare program may still be assembled at run time: it is looked up in PATH.
+        let config = serde_json::json!({
+            "params": {"properties": {"tool": {"type": "string"}}},
+            "install": {"command": ["${tool}", "--x"]}
+        });
+        assert!(refusals(config, "linux", &[]).is_empty());
     }
 
     #[test]
