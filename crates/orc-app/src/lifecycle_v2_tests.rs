@@ -311,7 +311,8 @@ async fn a_v2_uninstall_keeps_a_sourced_value_as_a_value() {
         "params": {"properties": {"peers": {"type": "string", "x-source": {"kind": "peers.all"}}}}
     }));
     let params = BTreeMap::from([("peers".to_owned(), "a\nb".to_owned())]);
-    let env = durable_phase_env_v2(&config, "1.0", "demo", &params, None).expect("env");
+    let env =
+        durable_phase_env_v2(&config, "1.0", "demo", &params, None, Path::new(".")).expect("env");
     assert_eq!(env.tokens["peers"], "a\nb");
     assert!(env.param_files.is_empty());
 }
@@ -636,6 +637,57 @@ async fn an_uninstall_hands_file_backed_params_over_as_files_it_then_removes() {
     }
     assert!(host_file.exists());
     assert_no_params_in_env(&work.path().join("uninstall.args.env"));
+}
+
+/// A kept secret an uninstall writes out is born owner-only, inside a private directory
+/// of the app's own that the phase removes: never a umask-mode file in the shared temp
+/// directory chmodded afterwards.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_v2_uninstall_writes_kept_secrets_into_a_private_dir_it_removes() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let work = tempfile::tempdir().expect("work");
+    // Records the path it was handed, and the modes of the file and its directory as the
+    // phase saw them.
+    let script = work.path().join("modes.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nfile=${1#--token-file=}\nprintf '%s\\n' \"$file\" > modes.out\n\
+         find \"$file\" -perm 600 >> modes.out\nfind \"$(dirname \"$file\")\" -maxdepth 0 -perm 700 >> modes.out\n",
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let config = v2(serde_json::json!({
+        "params": {"properties": {"token": {"type": "string", "sensitive": true}}},
+        "uninstall": {"command": ["./modes.sh", "--token-file=${token_file}"]}
+    }));
+    let params = BTreeMap::from([("token".to_owned(), "hunter2".to_owned())]);
+    let _ = run_uninstall_phase(
+        "demo",
+        "demo",
+        "1.0",
+        &config,
+        &params,
+        work.path(),
+        no_log(),
+        None,
+        None,
+    )
+    .await
+    .expect("uninstall");
+    let lines = read_lines(&work.path().join("modes.out"));
+    let file = PathBuf::from(&lines[0]);
+    let dir = file.parent().expect("dir").to_path_buf();
+    assert!(
+        dir.starts_with(work.path()),
+        "{} is not the app's own directory",
+        dir.display()
+    );
+    assert_eq!(
+        lines[1..],
+        [file.display().to_string(), dir.display().to_string()]
+    );
+    assert!(!dir.exists(), "{} outlived the phase", dir.display());
 }
 
 #[cfg(unix)]
