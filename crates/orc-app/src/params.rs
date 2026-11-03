@@ -17,6 +17,17 @@ fn is_implicitly_sensitive(property: &ParamProperty) -> bool {
         .is_some_and(|source| SECRET_SOURCE_KINDS.contains(&source.kind.as_str()))
 }
 
+/// Whether a param reaches a phase as a file rather than as a value: it is `sensitive`
+/// (declared, or implicitly by a secret source kind), sets `contentMediaType`, or is
+/// filled by a source kind delivered as a file (`peers.all`, `tls.key`).
+///
+/// One definition for the runtime and the format v2 publish checks, so a command the
+/// checker admits is one the runtime can fill.
+#[must_use]
+pub fn is_file_backed_property(property: &ParamProperty) -> bool {
+    is_file_backed(property)
+}
+
 fn is_file_backed(property: &ParamProperty) -> bool {
     property.sensitive
         || property.content_media_type.is_some()

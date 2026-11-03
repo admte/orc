@@ -24,5 +24,6 @@ pub mod reference;
 pub mod registry;
 pub mod service;
 pub mod state;
+pub mod v2;
 
 pub use error::{CliError, ExitCode, Result};
