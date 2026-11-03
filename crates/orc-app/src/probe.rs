@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use crate::app::{AppConfig, CommandValue, EndpointProbe, EndpointProtocol};
-use crate::lifecycle::{parse_duration, probe_command};
+use crate::app::{AppConfig, AppFormat, CommandValue, EndpointProbe, EndpointProtocol};
+use crate::lifecycle::{parse_duration, probe_command, probe_command_v2};
 
 /// Poll spacing when the manifest declares no `interval`.
 pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_secs(10);
@@ -79,6 +79,9 @@ pub enum ProbeKind {
     Http { port: u16, path: String, tls: bool },
     /// Run the app's own check; exit 0 passes.
     Command(CommandValue),
+    /// A format v2 app's check: an argv list taking the tokens of `start`
+    /// ([`ProbeContext::tokens`]); exit 0 passes. An empty list declares no probe.
+    CommandV2(Vec<String>),
     /// No probe at all (a `udp` endpoint without a `command` probe): readiness follows
     /// app readiness alone, so the endpoint reports `ready` once and never probes.
     AppReadiness,
@@ -108,7 +111,7 @@ pub fn plan_endpoint_probes(config: &AppConfig) -> Vec<EndpointProbePlan> {
             let probe = endpoint.probe.as_ref();
             EndpointProbePlan {
                 endpoint: name.clone(),
-                kind: probe_kind(endpoint.port, endpoint.protocol, probe),
+                kind: probe_kind(config.format, endpoint.port, endpoint.protocol, probe),
                 interval: probe_duration(
                     probe.and_then(|probe| probe.interval.as_deref()),
                     DEFAULT_PROBE_INTERVAL,
@@ -128,10 +131,25 @@ pub fn plan_endpoint_probes(config: &AppConfig) -> Vec<EndpointProbePlan> {
 /// case spec 180 leaves open: it is read as an explicit opt-out of the default
 /// connect probe, which leaves the endpoint following app readiness — the same
 /// place a probe-less `udp` endpoint lands.
-fn probe_kind(port: u16, protocol: EndpointProtocol, probe: Option<&EndpointProbe>) -> ProbeKind {
+fn probe_kind(
+    format: AppFormat,
+    port: u16,
+    protocol: EndpointProtocol,
+    probe: Option<&EndpointProbe>,
+) -> ProbeKind {
     if let Some(probe) = probe {
-        if let Some(command) = &probe.command {
-            return ProbeKind::Command(command.clone());
+        match (format, &probe.command) {
+            (AppFormat::V1, Some(command)) => return ProbeKind::Command(command.clone()),
+            // An empty v2 list skips the probe on this platform; the protocol decides.
+            (AppFormat::V2, Some(CommandValue::Argv(argv))) if !argv.is_empty() => {
+                return ProbeKind::CommandV2(argv.clone());
+            }
+            // A v2 string command is refused at publish; one that slipped past runs as
+            // what v2 would make of it, which is nothing it can run.
+            (AppFormat::V2, Some(CommandValue::String(command))) => {
+                return ProbeKind::CommandV2(vec![command.clone()]);
+            }
+            _ => {}
         }
         if let Some(path) = &probe.http {
             return ProbeKind::Http {
@@ -189,6 +207,10 @@ pub type DeliveredAddresses = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 pub struct ProbeContext {
     pub work_dir: PathBuf,
     pub env: BTreeMap<String, String>,
+    /// The run-time token values a format v2 app started with
+    /// ([`crate::lifecycle::StartCommand::tokens`]); its probe commands take them.
+    /// Empty for a v1 app, whose probes read `env`.
+    pub tokens: BTreeMap<String, String>,
     /// The host's own reachable address. `None` when none is recorded yet.
     pub host: Option<String>,
     /// The delivery addresses an endpoint is *also* served on. `None` on a runtime
@@ -201,6 +223,7 @@ impl std::fmt::Debug for ProbeContext {
         f.debug_struct("ProbeContext")
             .field("work_dir", &self.work_dir)
             .field("env", &self.env)
+            .field("tokens", &self.tokens.keys().collect::<Vec<_>>())
             .field("host", &self.host)
             .field("delivered_on", &self.delivered_on.is_some())
             .finish()
@@ -262,6 +285,7 @@ pub async fn run_probe(plan: &EndpointProbePlan, ctx: &ProbeContext) -> Result<(
         // The app's own check, run once: a command probe answers for the app rather
         // than for an address, and has no address to be run against.
         ProbeKind::Command(command) => command_probe(command, plan.timeout, ctx).await,
+        ProbeKind::CommandV2(argv) => command_probe_v2(argv, plan.timeout, ctx).await,
         // Nothing to poll: the endpoint is as ready as the app is.
         ProbeKind::AppReadiness => Ok(()),
     }
@@ -386,8 +410,25 @@ async fn command_probe(
     timeout: Duration,
     ctx: &ProbeContext,
 ) -> Result<(), String> {
-    let mut process = probe_command(command, &ctx.work_dir, &ctx.env)
+    let process = probe_command(command, &ctx.work_dir, &ctx.env)
         .map_err(|err| format!("probe command: {err}"))?;
+    run_command_probe(process, timeout).await
+}
+
+async fn command_probe_v2(
+    argv: &[String],
+    timeout: Duration,
+    ctx: &ProbeContext,
+) -> Result<(), String> {
+    let process = probe_command_v2(argv, &ctx.work_dir, &ctx.tokens)
+        .map_err(|err| format!("probe command: {err}"))?;
+    run_command_probe(process, timeout).await
+}
+
+async fn run_command_probe(
+    mut process: tokio::process::Command,
+    timeout: Duration,
+) -> Result<(), String> {
     // A probe's verdict is its exit status; its chatter would otherwise interleave
     // with the app's own log every tick.
     process.stdout(Stdio::null()).stderr(Stdio::null());
