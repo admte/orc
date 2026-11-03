@@ -1375,7 +1375,7 @@ async fn phase_env_v2(
     let mut env = PhaseEnv::default();
     apply_reboot_env(&mut env.vars, reboot);
     for param in params.values() {
-        if !delivered_as_file(param) {
+        if !delivered_as_file(config, param) {
             continue;
         }
         let bytes = match &param.value {
@@ -1414,10 +1414,19 @@ async fn phase_env_v2(
     Ok(env)
 }
 
-/// Whether a param reaches a v2 phase as a file: declared file-backed, or holding a
-/// secret reference, which is never handed over as a value.
-fn delivered_as_file(param: &ParsedParam) -> bool {
-    param.file_backed || matches!(param.value, ParsedParamValue::SecretRef(_))
+/// Whether a param reaches a v2 phase as a file: its manifest marks it `sensitive` or
+/// sets `contentMediaType` ([`crate::params::is_file_backed_v2`]), or it holds a secret
+/// reference, which is never handed over as a value.
+///
+/// Decided from the config, not from [`ParsedParam::file_backed`]: that flag is v1's rule,
+/// under which an `x-source` kind can make a param file-backed too, and in v2 no kind does.
+fn delivered_as_file(config: &AppConfig, param: &ParsedParam) -> bool {
+    let declared = config
+        .params
+        .as_ref()
+        .and_then(|params| params.properties.get(&param.name));
+    declared.is_some_and(crate::params::is_file_backed_v2)
+        || matches!(param.value, ParsedParamValue::SecretRef(_))
 }
 
 /// The value tokens of the params that are not file-backed. A host-sourced param that
@@ -1428,7 +1437,10 @@ fn plain_param_values(
     params: &BTreeMap<String, ParsedParam>,
 ) -> Result<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
-    for param in params.values().filter(|param| !delivered_as_file(param)) {
+    for param in params
+        .values()
+        .filter(|param| !delivered_as_file(config, param))
+    {
         let value = match &param.value {
             ParsedParamValue::String(value) | ParsedParamValue::Number(value) => value.clone(),
             ParsedParamValue::Boolean(value) => value.to_string(),
@@ -1574,8 +1586,11 @@ fn expand_service_v2(raw: &str, tokens: &BTreeMap<String, String>) -> Result<Str
     v2::token::substitute(raw, |name| tokens.get(name).map(String::as_str))
         .map_err(|err| CliError::Operational(format!("start.service {raw:?}: {err}")))?
         .ok_or_else(|| {
+            let lookup = |name: &str| tokens.get(name).map(String::as_str);
+            let token = v2::token::first_unset(raw, lookup).unwrap_or_default();
             CliError::Operational(format!(
-                "start.service {raw:?} names a value that is not set"
+                "start.service {raw:?}: {token} is not set, and a service name cannot lose a \
+                 piece"
             ))
         })
 }
@@ -1607,7 +1622,7 @@ fn durable_phase_env_v2(
             env.tokens.insert(name.clone(), value.clone());
             continue;
         }
-        if property(name).is_some_and(crate::params::is_file_backed_property) {
+        if property(name).is_some_and(crate::params::is_file_backed_v2) {
             let path = write_param_file(None, name, value.as_bytes())?;
             env.tokens
                 .insert(format!("{name}_file"), path.display().to_string());

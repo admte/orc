@@ -256,6 +256,82 @@ async fn a_v2_phase_environment_keeps_the_reboot_shim_and_nothing_else() {
     let _ = reboot.finish();
 }
 
+/// File-backed comes from the manifest alone (spec 214 *Tokens*): a param marked
+/// `sensitive` or setting `contentMediaType` is a file, and no `x-source` kind makes one —
+/// whatever v1's rule, carried in [`ParsedParam::file_backed`], says.
+#[tokio::test]
+async fn only_the_manifest_makes_a_v2_param_file_backed() {
+    let work = tempfile::tempdir().expect("work");
+    let config = v2(serde_json::json!({
+        "params": {"properties": {
+            "peers": {"type": "string", "x-source": {"kind": "peers.all"}},
+            "listing": {"type": "string", "contentMediaType": "text/plain", "x-source": {"kind": "peers.all"}},
+            "runner": {"type": "string", "sensitive": true, "x-source": {"kind": "github.runner"}}
+        }}
+    }));
+    // As the host hands them over: v1's rule marks every one of them file-backed, and the
+    // runner's credential arrives as content the host minted.
+    let params = BTreeMap::from([
+        param("peers", string("a.internal\nb.internal"), true),
+        param("listing", string("a.internal\nb.internal"), true),
+        param("runner", string("minted-credential"), true),
+    ]);
+    let env = phase_env_v2(
+        V2Phase::Install,
+        &config,
+        "1.0",
+        "demo",
+        &params,
+        None,
+        Some(work.path()),
+        None,
+        None,
+    )
+    .await
+    .expect("env");
+    assert_eq!(env.tokens["peers"], "a.internal\nb.internal");
+    assert!(!env.tokens.contains_key("peers_file"), "{:?}", env.tokens);
+    assert!(!env.tokens.contains_key("listing"), "{:?}", env.tokens);
+    assert_eq!(
+        std::fs::read_to_string(&env.tokens["listing_file"]).expect("listing"),
+        "a.internal\nb.internal"
+    );
+    assert!(!env.tokens.contains_key("runner"), "{:?}", env.tokens);
+    assert_eq!(
+        std::fs::read_to_string(&env.tokens["runner_file"]).expect("runner"),
+        "minted-credential"
+    );
+}
+
+/// The uninstall map follows the same rule: a kept value for a param no manifest flag
+/// makes file-backed is a value token, whichever kind filled it.
+#[tokio::test]
+async fn a_v2_uninstall_keeps_a_sourced_value_as_a_value() {
+    let config = v2(serde_json::json!({
+        "params": {"properties": {"peers": {"type": "string", "x-source": {"kind": "peers.all"}}}}
+    }));
+    let params = BTreeMap::from([("peers".to_owned(), "a\nb".to_owned())]);
+    let env = durable_phase_env_v2(&config, "1.0", "demo", &params, None).expect("env");
+    assert_eq!(env.tokens["peers"], "a\nb");
+    assert!(env.param_files.is_empty());
+}
+
+/// A program and a service name cannot lose a piece: each fails, naming the token.
+#[test]
+fn a_dropped_program_or_service_piece_is_an_error_naming_the_token() {
+    let err = v2::command::command_argv(
+        &["${tool}".to_owned(), "x".to_owned()],
+        &BTreeMap::new(),
+        Path::new("/srv"),
+        v2::command::CommandHost::Unix,
+    )
+    .expect_err("no program");
+    assert!(err.to_string().contains("${tool} is not set"), "{err}");
+    let config = v2(serde_json::json!({"start": {"service": "runner-${pool}-${version}"}}));
+    let err = instance_service_name(&config, "runner", "1.0", &BTreeMap::new()).expect_err("unset");
+    assert!(err.to_string().contains("${pool} is not set"), "{err}");
+}
+
 #[cfg(unix)]
 struct V2App {
     work: tempfile::TempDir,
@@ -502,7 +578,7 @@ async fn an_uninstall_hands_file_backed_params_over_as_files_it_then_removes() {
             "properties": {
                 "url": {"type": "string"},
                 "token": {"type": "string", "sensitive": true},
-                "peers": {"type": "string", "x-source": {"kind": "peers.all"}},
+                "peers": {"type": "string", "contentMediaType": "text/plain", "x-source": {"kind": "peers.all"}},
                 "doc": {"type": "string", "contentMediaType": "application/json"}
             }
         },

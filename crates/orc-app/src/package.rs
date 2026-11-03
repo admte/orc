@@ -85,18 +85,6 @@ impl PackageOptions {
 
 const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const ANNOTATIONS_FILE: &str = "annotations.json";
-const VALID_X_SOURCE_KINDS: &[&str] = &[
-    "peers.gossip",
-    "peers.all",
-    "peers.first",
-    "peers.any",
-    "pool.slot",
-    "pool.name",
-    "ca.bundle",
-    "tls.cert",
-    "tls.key",
-    "github.runner",
-];
 const ENDPOINT_PROTOCOLS: &[&str] = &["tcp", "udp", "http", "https"];
 /// Serve modes an endpoint may declare (spec 180). `role` is reserved for a later
 /// field and is not accepted: refusing it now keeps its meaning open, where accepting
@@ -507,7 +495,7 @@ pub fn check_app_config(
 /// Whether this build of orc knows `kind` as a param `x-source` kind.
 #[must_use]
 pub fn is_known_source_kind(kind: &str) -> bool {
-    VALID_X_SOURCE_KINDS.contains(&kind)
+    crate::params::source_kind(kind).is_some()
 }
 
 /// The warning shown for param `param` naming a source kind this build does not know.
