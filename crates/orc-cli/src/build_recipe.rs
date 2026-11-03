@@ -6,13 +6,15 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 use crate::app::{
-    APP_ARTIFACT_TYPE, APP_CONFIG_MEDIA_TYPE, OCI_IMAGE_INDEX, OS_RECIPE_ARTIFACT_TYPE,
-    OS_RECIPE_CONFIG_MEDIA_TYPE, Platform, ZSTD_CHUNKED_MEDIA_SUFFIX,
+    APP_ARTIFACT_TYPE, APP_CONFIG_MEDIA_TYPE, APP_V2_ARTIFACT_TYPE, APP_V2_CONFIG_MEDIA_TYPE,
+    AppFormat, OCI_IMAGE_INDEX, OS_RECIPE_ARTIFACT_TYPE, OS_RECIPE_CONFIG_MEDIA_TYPE, Platform,
+    ZSTD_CHUNKED_MEDIA_SUFFIX,
 };
 use crate::error::{CliError, Result};
 use crate::local_artifact_store::{CachedDescriptor, OCI_MANIFEST_MEDIA_TYPE, descriptor_for};
 use crate::package::{
-    PackageFormat, PackageOptions, is_known_source_kind, unknown_source_kind_warning,
+    PackageFormat, PackageOptions, UnknownSourceKinds, check_app_config, is_known_source_kind,
+    unknown_source_kind_warning,
 };
 use crate::registry::digest_bytes;
 use orc_app::chunked::{CHUNK_SIZE_FLOOR, ChunkedEncodeOptions, encode_chunked_layer};
@@ -124,6 +126,73 @@ impl RecipePlatform {
 #[derive(Debug)]
 struct BuildContext {
     platform: Option<RecipePlatform>,
+    /// The app format the recipe builds: v1's `{name}` interpolation, or v2's `${name}`
+    /// tokens and per-OS values (spec 214). v1 for every non-app artifact.
+    format: AppFormat,
+    /// A v2 recipe's build-time names: `os`, `arch` and every platform's `vars`.
+    build_vars: BTreeSet<String>,
+    /// The platform's label, `linux/amd64`, for a v2 refusal to name.
+    label: String,
+}
+
+impl BuildContext {
+    fn new(platform: Option<RecipePlatform>, recipe: &Recipe) -> Self {
+        let format = AppFormat::from_artifact_type(&recipe.artifact_type)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let label = platform.as_ref().map_or_else(
+            || "any platform".to_owned(),
+            |platform| platform.platform().label(),
+        );
+        Self {
+            platform,
+            format,
+            build_vars: orc_app::v2::build::build_var_names(
+                recipe.platforms.iter().map(|platform| &platform.vars),
+            ),
+            label,
+        }
+    }
+
+    fn build_platform(&self) -> Option<orc_app::v2::build::BuildPlatform<'_>> {
+        self.platform
+            .as_ref()
+            .map(|platform| orc_app::v2::build::BuildPlatform {
+                os: &platform.os,
+                arch: &platform.architecture,
+                label: &self.label,
+                vars: &platform.vars,
+            })
+    }
+
+    /// Runs the v2 publish checks on the built config and the files as packaged,
+    /// executable bits included (spec 214 *Publish checks*). Nothing for v1.
+    fn check_v2(
+        &self,
+        config_bytes: &[u8],
+        packaged: &[orc_app::v2::check::PackagedFile],
+    ) -> Result<()> {
+        if self.format != AppFormat::V2 {
+            return Ok(());
+        }
+        let platform = self.platform.as_ref().map(RecipePlatform::platform);
+        orc_app::v2::build::check_built(config_bytes, platform.as_ref(), &self.build_vars, packaged)
+    }
+
+    /// Resolves a recipe string outside `config:` — a file path, a sha256 — in the
+    /// recipe's own syntax.
+    fn interpolate(&self, input: &str, place: &str) -> Result<String> {
+        match self.format {
+            AppFormat::V1 => interpolate_string(input, self),
+            AppFormat::V2 => orc_app::v2::build::build_string(
+                input,
+                place,
+                self.build_platform(),
+                &self.build_vars,
+            ),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -303,9 +372,7 @@ async fn build_manifest(
     options: PackageOptions,
     reporter: Option<&dyn ProgressReporter>,
 ) -> Result<BuiltManifest> {
-    let config = interpolate_yaml(&recipe.config, context)?;
-    let config_bytes = serde_json::to_vec(&config)
-        .map_err(|err| CliError::Operational(format!("encode config JSON: {err}")))?;
+    let config_bytes = platform_config_bytes(recipe, context)?;
     let warnings = validate_config(&recipe.artifact_type, &config_bytes)?;
     let config_digest = digest_bytes(&config_bytes);
     let mut blobs = vec![Blob {
@@ -314,14 +381,19 @@ async fn build_manifest(
     }];
     let mut layers = Vec::new();
     let mut seen = BTreeSet::new();
-    for entry in &recipe.files {
-        let file = materialize_file(root, entry, context, reporter).await?;
+    let mut packaged = Vec::new();
+    for (index, entry) in recipe.files.iter().enumerate() {
+        let file = materialize_file(root, entry, index, context, reporter).await?;
         if !seen.insert(file.title.clone()) {
             return Err(CliError::Usage(format!(
                 "duplicate file path {:?}",
                 file.title
             )));
         }
+        packaged.push(orc_app::v2::check::PackagedFile {
+            title: file.title.clone(),
+            executable: file.executable,
+        });
         let mut annotations =
             BTreeMap::from([("org.opencontainers.image.title".to_owned(), file.title)]);
         if file.executable {
@@ -366,6 +438,7 @@ async fn build_manifest(
         });
         blobs.push(Blob { digest, body });
     }
+    context.check_v2(&config_bytes, &packaged)?;
     layers.sort_by(|left, right| {
         layer_title(left)
             .unwrap_or_default()
@@ -400,9 +473,25 @@ async fn build_manifest(
     })
 }
 
+/// The config blob one platform's manifest carries: v1's interpolated `config:`, or v2's
+/// with per-OS values and build tokens resolved.
+fn platform_config_bytes(recipe: &Recipe, context: &BuildContext) -> Result<Vec<u8>> {
+    let config = match context.format {
+        AppFormat::V1 => interpolate_yaml(&recipe.config, context)?,
+        AppFormat::V2 => orc_app::v2::build::platform_config(
+            &recipe.config,
+            context.build_platform(),
+            &context.build_vars,
+        )?,
+    };
+    serde_json::to_vec(&config)
+        .map_err(|err| CliError::Operational(format!("encode config JSON: {err}")))
+}
+
 async fn materialize_file(
     root: &Path,
     entry: &FileEntry,
+    index: usize,
     context: &BuildContext,
     reporter: Option<&dyn ProgressReporter>,
 ) -> Result<FileMaterial> {
@@ -412,7 +501,7 @@ async fn materialize_file(
             (path.as_str(), url.as_deref(), sha256.as_deref())
         }
     };
-    let interpolated_path = interpolate_string(path, context)?;
+    let interpolated_path = context.interpolate(path, &format!("files[{index}].path"))?;
     let relative = safe_relative_path(&interpolated_path)?;
     let title = relative
         .iter()
@@ -421,7 +510,7 @@ async fn materialize_file(
         .join("/");
     let local = root.join(&relative);
     let expected = sha256
-        .map(|value| interpolate_string(value, context))
+        .map(|value| context.interpolate(value, &format!("files[{index}].sha256")))
         .transpose()?;
     let body = file_bytes(&local, url, expected.as_deref(), reporter, &title).await?;
     let executable = is_executable(&local);
@@ -512,9 +601,9 @@ fn report_file(reporter: Option<&dyn ProgressReporter>, title: &str, phase: &Pro
 fn build_contexts(recipe: &Recipe, selected: &[Platform]) -> Result<Vec<BuildContext>> {
     if recipe.platforms.is_empty() {
         if !selected.is_empty() {
-            return Ok(vec![BuildContext { platform: None }]);
+            return Ok(vec![BuildContext::new(None, recipe)]);
         }
-        return Ok(vec![BuildContext { platform: None }]);
+        return Ok(vec![BuildContext::new(None, recipe)]);
     }
     let mut contexts = Vec::new();
     for platform in &recipe.platforms {
@@ -523,9 +612,7 @@ fn build_contexts(recipe: &Recipe, selected: &[Platform]) -> Result<Vec<BuildCon
                 .iter()
                 .any(|selected| selected.label() == platform.platform().label())
         {
-            contexts.push(BuildContext {
-                platform: Some(platform.clone()),
-            });
+            contexts.push(BuildContext::new(Some(platform.clone()), recipe));
         }
     }
     if contexts.is_empty() {
@@ -632,6 +719,7 @@ fn safe_relative_path(path: &str) -> Result<PathBuf> {
 fn config_media_type(artifact_type: &str) -> Result<&'static str> {
     match artifact_type {
         APP_ARTIFACT_TYPE => Ok(APP_CONFIG_MEDIA_TYPE),
+        APP_V2_ARTIFACT_TYPE => Ok(APP_V2_CONFIG_MEDIA_TYPE),
         KVM_ARTIFACT_TYPE => Ok(KVM_CONFIG_MEDIA_TYPE),
         OS_RECIPE_ARTIFACT_TYPE => Ok(OS_RECIPE_CONFIG_MEDIA_TYPE),
         _ => Err(CliError::Usage(format!(
@@ -656,6 +744,13 @@ fn validate_config(artifact_type: &str, body: &[u8]) -> Result<Vec<String>> {
                 warnings.push(unknown_source_kind_warning(name, &source.kind));
             }
         }
+    }
+    if artifact_type == APP_V2_ARTIFACT_TYPE {
+        // A v2 config is held to the whole authoring contract — params vocabulary,
+        // endpoints, persist — beside the v2 checks that run once its files are known.
+        serde_json::from_slice::<crate::app::AppConfig>(body)
+            .map_err(|err| CliError::Usage(format!("invalid app config: {err}")))?;
+        warnings.extend(check_app_config(body, UnknownSourceKinds::Warn)?);
     }
     if artifact_type == OS_RECIPE_ARTIFACT_TYPE {
         validate_os_recipe_config(body)?;

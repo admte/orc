@@ -750,13 +750,25 @@ async fn info(args: AppReadArgs, settings: &CliSettings, config: &StoredConfig) 
             resolved.full
         )));
     };
-    let info = build_info_document(
+    // The phases read as this host's platform's, where the package has one: a v2 app's
+    // commands are resolved per platform at build.
+    let platform_config =
+        crate::versions::read_platform_config(&registry, &resolved.repository, &resolved.tag)
+            .await?;
+    let (config, config_platform) = match platform_config {
+        Some((config, platform)) => (Some(config), Some(platform)),
+        None => (summary.config, None),
+    };
+    let mut info = build_info_document(
         resolved.full,
         summary.digest,
         summary.description,
         unique_platforms(summary.platforms),
-        summary.config.as_ref(),
+        config.as_ref(),
     );
+    if info.format == "v2" {
+        info.config_platform = config_platform;
+    }
     print_info(&info, args.output)
 }
 
@@ -1838,16 +1850,18 @@ fn count_manifest_blobs(descriptor: &CachedDescriptor) -> Result<usize> {
     }
 }
 
+/// The manifest is an app of a format this orc runs; an app of a newer format is refused
+/// by name before anything is cached or installed (spec 214 *Format version*).
 fn validate_app_manifest(manifest: &crate::app::ImageManifest) -> Result<()> {
-    if manifest.schema_version != 2
-        || manifest.artifact_type != crate::app::APP_ARTIFACT_TYPE
-        || manifest.config.media_type != crate::app::APP_CONFIG_MEDIA_TYPE
-    {
-        return Err(CliError::NotFound(
-            "manifest is not an ORC app artifact".to_owned(),
-        ));
+    let not_an_app = || CliError::NotFound("manifest is not an ORC app artifact".to_owned());
+    if manifest.schema_version != 2 {
+        return Err(not_an_app());
     }
-    Ok(())
+    match crate::app::AppFormat::of_manifest(&manifest.artifact_type, &manifest.config.media_type) {
+        Ok(_) => Ok(()),
+        Err(CliError::NotFound(_)) => Err(not_an_app()),
+        Err(err) => Err(err),
+    }
 }
 
 fn select_child_descriptor<'a>(
@@ -1892,7 +1906,7 @@ fn no_matching_platform(children: &[crate::app::Descriptor]) -> CliError {
     CliError::NotFound(format!("no matching platform; available: {available}"))
 }
 
-fn host_platform_label() -> String {
+pub(crate) fn host_platform_label() -> String {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
         other => other,
@@ -2263,6 +2277,8 @@ struct InstallMaterializedPackage {
     digest: String,
     files: usize,
     platform: String,
+    /// Says which app format `config_bytes` is.
+    config_media_type: String,
     config_bytes: Vec<u8>,
     blob_digests: Vec<String>,
 }
@@ -2273,6 +2289,7 @@ impl From<CachedMaterializedPackage> for InstallMaterializedPackage {
             digest: value.digest,
             files: value.files,
             platform: value.platform,
+            config_media_type: value.config_media_type,
             config_bytes: value.config_bytes,
             blob_digests: value.blob_digests,
         }
@@ -2285,6 +2302,7 @@ impl From<MaterializedPackage> for InstallMaterializedPackage {
             digest: value.digest,
             files: value.files,
             platform: value.platform,
+            config_media_type: value.config_media_type,
             config_bytes: value.config_bytes,
             blob_digests: value.blob_digests,
         }
@@ -2352,8 +2370,7 @@ async fn install_fresh_app(request: FreshInstall<'_>) -> Result<FreshOutcome> {
         dest,
         reference,
     } = materialized;
-    let app_config = serde_json::from_slice::<AppConfig>(&result.config_bytes)
-        .map_err(|err| CliError::Operational(format!("decode app config: {err}")))?;
+    let app_config = AppConfig::parse_media_type(&result.config_media_type, &result.config_bytes)?;
     let params = parse_app_params(
         app_config.params.as_ref(),
         request.param_args,
@@ -3878,18 +3895,22 @@ async fn uninstall(args: AppArg, settings: &CliSettings, config: &StoredConfig) 
         }
     }
 
-    let _ = run_uninstall_phase(
+    let uninstall_params =
+        uninstall_params(&target.config, &target.record.params, &target.work_dir)?;
+    let ran = run_uninstall_phase(
         &app,
         &app,
         &version,
         &target.config,
-        &target.record.params,
+        &uninstall_params,
         &target.work_dir,
         terminal_log_line(),
         None,
         operator.source(),
     )
-    .await?;
+    .await;
+    let _ = std::fs::remove_dir_all(target.work_dir.join(UNINSTALL_FILES_DIR));
+    let _ = ran?;
     if target.work_dir.exists() {
         std::fs::remove_dir_all(&target.work_dir).map_err(|err| {
             CliError::Operational(format!("remove {}: {err}", target.work_dir.display()))
@@ -3902,16 +3923,76 @@ async fn uninstall(args: AppArg, settings: &CliSettings, config: &StoredConfig) 
     Ok(())
 }
 
+/// Where a v2 uninstall's copies of `@file` params are written, inside the work directory
+/// and removed with the phase.
+const UNINSTALL_FILES_DIR: &str = ".orc-uninstall";
+
+/// The params an uninstall phase is handed, from the install record.
+///
+/// A v1 app gets the record as it is. A v2 app gets its `@file` params as what they hold:
+/// a file-backed one as an owner-only copy named by `<name>_file`, which the runtime hands
+/// over as `${name_file}`; any other as its text, the value it was installed with.
+fn uninstall_params(
+    config: &AppConfig,
+    recorded: &std::collections::BTreeMap<String, String>,
+    work_dir: &Path,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    if config.format != crate::app::AppFormat::V2 {
+        return Ok(recorded.clone());
+    }
+    let properties = config.params.as_ref().map(|params| &params.properties);
+    let mut params = std::collections::BTreeMap::new();
+    for (name, value) in recorded {
+        let property = properties.and_then(|properties| properties.get(name));
+        let (Some(property), Some(source)) = (property, value.strip_prefix('@')) else {
+            params.insert(name.clone(), value.clone());
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(source) else {
+            eprintln!(
+                "warning: --{} file {source} is gone; uninstall runs without it",
+                name.replace('_', "-")
+            );
+            continue;
+        };
+        if orc_app::params::is_file_backed_property(property) {
+            let dir = work_dir.join(UNINSTALL_FILES_DIR);
+            let path = write_owner_only(&dir, name, &bytes)?;
+            params.insert(format!("{name}_file"), path.display().to_string());
+        } else {
+            params.insert(name.clone(), String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+    Ok(params)
+}
+
+/// Writes `bytes` to `dir/name`, readable by this user alone.
+fn write_owner_only(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let operational =
+        |err: std::io::Error| CliError::Operational(format!("write {}: {err}", dir.display()));
+    std::fs::create_dir_all(dir).map_err(operational)?;
+    let path = dir.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(operational)?;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(operational)?;
+    std::io::Write::write_all(&mut file, bytes).map_err(operational)?;
+    Ok(path)
+}
+
 fn is_not_running_state(state: &str) -> bool {
     matches!(state, "stopped" | "completed" | "failed")
 }
 
+/// The config an installed app's work directory holds, in the format its file says.
 fn read_materialized_app_config(materialized: &std::path::Path) -> Result<AppConfig> {
-    let path = materialized.join("app.config.v1.json");
-    let bytes = std::fs::read(&path)
-        .map_err(|err| CliError::Operational(format!("read {}: {err}", path.display())))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|err| CliError::Operational(format!("decode {}: {err}", path.display())))
+    orc_app::app::read_config(materialized)
 }
 
 fn status(args: &StatusArgs) -> Result<()> {

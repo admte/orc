@@ -4,10 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::app::{
-    APP_ARTIFACT_TYPE, APP_CONFIG_MEDIA_TYPE, Descriptor, ImageManifest, ManifestDocument,
-    has_chunked_suffix,
-};
+use crate::app::{AppFormat, Descriptor, ImageManifest, ManifestDocument, has_chunked_suffix};
 use crate::cache::{human_size, read_blob};
 use crate::error::{CliError, Result};
 use crate::registry::digest_bytes;
@@ -173,6 +170,11 @@ pub fn materialize_cached_package(
     let Some(resolved) = resolve_cached_package_ref(reference, platform)? else {
         return Ok(None);
     };
+    // A directory reused across a re-push that changed the app's format must not keep
+    // the old format's config beside the new one.
+    if let Some(format) = AppFormat::from_config_media_type(&resolved.config_media_type)? {
+        orc_app::app::remove_other_configs(dest, format);
+    }
     let mut outputs = Vec::new();
     outputs.push(OutputFile {
         title: config_filename(&resolved.config_media_type)?,
@@ -589,16 +591,18 @@ fn resolve_cached_package(
     })
 }
 
+/// The cached manifest is an app of a format this orc runs; an app of a newer format is
+/// refused by name (spec 214 *Format version*).
 fn validate_app_manifest(manifest: &ImageManifest) -> Result<()> {
-    if manifest.schema_version != 2
-        || manifest.artifact_type != APP_ARTIFACT_TYPE
-        || manifest.config.media_type != APP_CONFIG_MEDIA_TYPE
-    {
-        return Err(CliError::NotFound(
-            "cached manifest is not an ORC app artifact".to_owned(),
-        ));
+    let not_an_app = || CliError::NotFound("cached manifest is not an ORC app artifact".to_owned());
+    if manifest.schema_version != 2 {
+        return Err(not_an_app());
     }
-    Ok(())
+    match AppFormat::of_manifest(&manifest.artifact_type, &manifest.config.media_type) {
+        Ok(_) => Ok(()),
+        Err(CliError::NotFound(_)) => Err(not_an_app()),
+        Err(err) => Err(err),
+    }
 }
 
 fn select_child_descriptor<'a>(
