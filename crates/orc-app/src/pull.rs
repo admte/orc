@@ -144,11 +144,6 @@ async fn materialize_resolved(
     dest: &Path,
     force: bool,
 ) -> Result<MaterializedPackage> {
-    // A directory reused across a re-push that changed the app's format must not keep
-    // the old format's config beside the new one.
-    if let Some(format) = AppFormat::from_config_media_type(&resolved.config_media_type)? {
-        crate::app::remove_other_configs(dest, format);
-    }
     let mut outputs = Vec::new();
     outputs.push(OutputFile {
         title: config_filename(&resolved.config_media_type)?,
@@ -168,7 +163,29 @@ async fn materialize_resolved(
         });
     }
 
+    // Every conflict is refused before a byte is fetched, and the payloads are all in
+    // hand before anything in `dest` changes.
+    let layer_titles = resolved
+        .manifest
+        .layers
+        .iter()
+        .map(layer_title)
+        .collect::<Result<Vec<_>>>()?;
+    refuse_conflicts(
+        dest,
+        outputs
+            .iter()
+            .map(|output| output.title.as_str())
+            .chain(layer_titles.iter().map(String::as_str)),
+        force,
+    )?;
     outputs.extend(fetch_payloads(registry, repository, &resolved.manifest.layers).await?);
+    // Only now, immediately before the new config is written: a directory reused across
+    // a re-push that changed the app's format must not keep the old format's config
+    // beside the new one, and a refused or failed pull must not have lost it.
+    if let Some(format) = AppFormat::from_config_media_type(&resolved.config_media_type)? {
+        crate::app::remove_other_configs(dest, format);
+    }
 
     for output in &outputs {
         let file_event =
@@ -705,6 +722,29 @@ struct OutputFile {
     body: Vec<u8>,
     executable: bool,
     blob_digests: Vec<String>,
+}
+
+/// Refuses, before anything is fetched or touched, every output path that already exists
+/// when the caller did not ask to overwrite: a refused materialization leaves `dest`
+/// exactly as it was.
+fn refuse_conflicts<'a>(
+    dest: &Path,
+    titles: impl IntoIterator<Item = &'a str>,
+    force: bool,
+) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    for title in titles {
+        let path = dest.join(safe_relative_path(title)?);
+        if path.exists() {
+            return Err(CliError::Conflict(format!(
+                "{} already exists; use --force to overwrite",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_output(dest: &Path, output: &OutputFile, force: bool) -> Result<()> {

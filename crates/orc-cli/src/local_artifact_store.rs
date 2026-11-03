@@ -170,11 +170,6 @@ pub fn materialize_cached_package(
     let Some(resolved) = resolve_cached_package_ref(reference, platform)? else {
         return Ok(None);
     };
-    // A directory reused across a re-push that changed the app's format must not keep
-    // the old format's config beside the new one.
-    if let Some(format) = AppFormat::from_config_media_type(&resolved.config_media_type)? {
-        orc_app::app::remove_other_configs(dest, format);
-    }
     let mut outputs = Vec::new();
     outputs.push(OutputFile {
         title: config_filename(&resolved.config_media_type)?,
@@ -193,7 +188,29 @@ pub fn materialize_cached_package(
             blob_digests: Vec::new(),
         });
     }
+    // Every conflict is refused before anything is read, and the payloads are all in
+    // hand before anything in `dest` changes.
+    let layer_titles = resolved
+        .manifest
+        .layers
+        .iter()
+        .map(layer_title)
+        .collect::<Result<Vec<_>>>()?;
+    refuse_conflicts(
+        dest,
+        outputs
+            .iter()
+            .map(|output| output.title.as_str())
+            .chain(layer_titles.iter().map(String::as_str)),
+        force,
+    )?;
     outputs.extend(cached_payloads(&resolved.manifest.layers)?);
+    // Only now, immediately before the new config is written: a directory reused across
+    // a re-push that changed the app's format must not keep the old format's config
+    // beside the new one, and a refused or failed install must not have lost it.
+    if let Some(format) = AppFormat::from_config_media_type(&resolved.config_media_type)? {
+        orc_app::app::remove_other_configs(dest, format);
+    }
 
     // Payload bytes came from the local cache; signal that nothing was fetched.
     for digest in outputs.iter().flat_map(|output| &output.blob_digests) {
@@ -755,6 +772,29 @@ struct OutputFile {
     body: Vec<u8>,
     executable: bool,
     blob_digests: Vec<String>,
+}
+
+/// Refuses, before anything is fetched or touched, every output path that already exists
+/// when the caller did not ask to overwrite: a refused materialization leaves `dest`
+/// exactly as it was.
+fn refuse_conflicts<'a>(
+    dest: &Path,
+    titles: impl IntoIterator<Item = &'a str>,
+    force: bool,
+) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    for title in titles {
+        let path = dest.join(safe_relative_path(title)?);
+        if path.exists() {
+            return Err(CliError::Conflict(format!(
+                "{} already exists; use --force to overwrite",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_output(dest: &Path, output: &OutputFile, force: bool) -> Result<()> {

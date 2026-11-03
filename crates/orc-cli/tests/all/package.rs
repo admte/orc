@@ -830,6 +830,116 @@ async fn pull_materializes_unchunked_manifest_and_refuses_conflicts() {
     );
 }
 
+/// One app version: its manifest, config and one payload, under `format` (`1` or `2`).
+/// `serve_payload: false` leaves the payload blob out, so fetching it fails.
+fn app_version_routes(
+    tag: &str,
+    format: u8,
+    payload_title: &str,
+    serve_payload: bool,
+) -> BTreeMap<String, MockBytes> {
+    let config = format!(r#"{{"default_version":"{tag}"}}"#).into_bytes();
+    let payload = format!("#!/bin/sh\necho {tag}\n").into_bytes();
+    let config_digest = digest_bytes(&config);
+    let payload_digest = digest_bytes(&payload);
+    let manifest = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "artifactType": format!("application/vnd.orc8r.app.v{format}"),
+        "config": {
+            "mediaType": format!("application/vnd.orc8r.app.config.v{format}+json"),
+            "digest": config_digest,
+            "size": config.len()
+        },
+        "layers": [{
+            "mediaType": "text/x-shellscript",
+            "digest": payload_digest,
+            "size": payload.len(),
+            "annotations": {"org.opencontainers.image.title": payload_title}
+        }]
+    }))
+    .expect("manifest");
+    let mut routes = BTreeMap::from([
+        (
+            format!("/v2/acme/demo/manifests/{tag}"),
+            MockBytes::new(manifest, "application/vnd.oci.image.manifest.v1+json"),
+        ),
+        (
+            format!("/v2/acme/demo/blobs/{config_digest}"),
+            MockBytes::new(config, "application/json"),
+        ),
+    ]);
+    if serve_payload {
+        routes.insert(
+            format!("/v2/acme/demo/blobs/{payload_digest}"),
+            MockBytes::new(payload, "text/x-shellscript"),
+        );
+    }
+    routes
+}
+
+/// A pull that is refused (a conflict without `--force`) or fails (a payload it cannot
+/// fetch) leaves the directory as it was: the installed app keeps its config, of whichever
+/// format, and no config of another format appears beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_or_failed_pull_keeps_the_installed_config() {
+    let mut routes = app_version_routes("1.0", 1, "run.sh", true);
+    routes.extend(app_version_routes("2.0", 2, "run.sh", true));
+    routes.extend(app_version_routes("3.0", 2, "other.sh", false));
+    let server = PullMockServer::start(routes).await;
+    let cache = tempfile::tempdir().expect("cache");
+    let dest = tempfile::tempdir().expect("dest");
+    let pull = |tag: &str, force: bool| {
+        let mut args = vec![
+            "--registry".to_owned(),
+            format!("{}/acme", server.registry()),
+            "pull".to_owned(),
+            format!("demo:{tag}"),
+            dest.path().display().to_string(),
+        ];
+        if force {
+            args.push("--force".to_owned());
+        }
+        Command::new(env!("CARGO_BIN_EXE_orc"))
+            .args(&args)
+            .env("ORC_CACHE_DIR", cache.path())
+            .output()
+            .expect("run pull")
+    };
+    let v1 = dest.path().join("app.config.v1.json");
+    let v2 = dest.path().join("app.config.v2.json");
+
+    assert_success(&pull("1.0", false));
+    assert!(v1.exists());
+
+    // Refused: run.sh is already there and --force was not given.
+    let refused = pull("2.0", false);
+    assert_eq!(refused.status.code(), Some(5), "{}", output_text(&refused));
+    assert!(v1.exists(), "a refused pull deleted the installed config");
+    assert!(
+        !v2.exists(),
+        "a refused pull wrote a config of another format"
+    );
+
+    // Failed: the payload cannot be fetched, so nothing may change.
+    let failed = pull("3.0", true);
+    assert!(!failed.status.success(), "{}", output_text(&failed));
+    assert!(v1.exists(), "a failed pull deleted the installed config");
+    assert!(
+        !v2.exists(),
+        "a failed pull wrote a config of another format"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.path().join("run.sh")).expect("payload"),
+        "#!/bin/sh\necho 1.0\n"
+    );
+
+    // A pull that goes through replaces the format: one config, the new one.
+    assert_success(&pull("2.0", true));
+    assert!(!v1.exists());
+    assert!(v2.exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pull_without_dir_caches_blobs_and_does_not_materialize_files() {
     let config = b"{}".to_vec();

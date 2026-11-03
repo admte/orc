@@ -399,3 +399,41 @@ fn orc_installs_and_uninstalls_a_v2_app_with_params_as_tokens() {
     // The operator's own file is theirs; the runtime only ever handed over copies.
     assert!(token.exists());
 }
+
+/// `orc install` materializes through the same path as `orc pull`. A work dir an earlier
+/// install left behind (its install phase failed, so nothing was recorded) keeps its
+/// config when a later install of the same tag, now v2, is refused for the files there.
+#[test]
+fn a_refused_install_keeps_the_config_a_failed_one_left() {
+    let dirs = Dirs::new();
+    let build = |recipe: &str| {
+        let package = tempfile::tempdir().expect("package");
+        std::fs::write(package.path().join("artifact.yaml"), recipe).expect("recipe");
+        std::fs::write(package.path().join("run.sh"), "#!/bin/sh\n").expect("payload");
+        let output = dirs.orc(&[
+            "--registry",
+            UNREACHABLE_PREFIX,
+            "build",
+            package.path().to_str().expect("path"),
+            "--tag",
+            "demo",
+        ]);
+        assert_success(&output);
+    };
+    build(
+        "artifactType: application/vnd.orc8r.app.v1\nconfig:\n  install: {command: \"exit 3\"}\nfiles: [run.sh]\n",
+    );
+    let failed = dirs.orc(&["--registry", UNREACHABLE_PREFIX, "install", "demo"]);
+    assert!(!failed.status.success(), "{failed:?}");
+    let work_dir = dirs.state.path().join("apps/demo/default");
+    assert!(work_dir.join("app.config.v1.json").exists(), "{failed:?}");
+
+    build("artifactType: application/vnd.orc8r.app.v2\nconfig: {}\nfiles: [run.sh]\n");
+    let refused = dirs.orc(&["--registry", UNREACHABLE_PREFIX, "install", "demo"]);
+    assert_eq!(refused.status.code(), Some(5), "{refused:?}");
+    assert!(
+        work_dir.join("app.config.v1.json").exists(),
+        "a refused install deleted the config"
+    );
+    assert!(!work_dir.join("app.config.v2.json").exists());
+}
