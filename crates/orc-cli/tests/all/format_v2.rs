@@ -147,6 +147,7 @@ fn assert_success(output: &Output) {
     );
 }
 
+#[cfg(unix)]
 fn cached_manifests(cache: &Path) -> Vec<serde_json::Value> {
     std::fs::read_dir(cache.join("manifests/sha256"))
         .expect("manifests")
@@ -157,6 +158,7 @@ fn cached_manifests(cache: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+#[cfg(unix)]
 fn blob(cache: &Path, digest: &str) -> serde_json::Value {
     let hex = digest.strip_prefix("sha256:").expect("digest");
     serde_json::from_slice(&std::fs::read(cache.join("blobs/sha256").join(hex)).expect("blob"))
