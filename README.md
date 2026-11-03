@@ -179,6 +179,8 @@ platforms:
   - {os: windows, arch: amd64, vars: {ext: ".exe"}}
 ```
 
+A command given as a list, like this one, runs with no shell in between, which suits a long-running app; a string runs under the user's login shell. On Linux and macOS, stopping an app signals its whole process group either way.
+
 Provide the listed files before building, with executable permissions for Unix binaries. orc CLI assembles packages from those files; compile your application with its usual build tools first.
 
 Build every declared platform, or select one whose binary you have available:

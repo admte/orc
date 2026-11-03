@@ -1375,18 +1375,6 @@ fn set_private_file(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether a phase command leads its own process group.
-///
-/// Phases the runtime may have to cut short — the stop command while the app is still
-/// alive, the stopped hook under a cap — lead one, so ending them ends whatever they
-/// started rather than orphaning it. The phases that simply run to completion stay in
-/// the runtime's group, where an operator's Ctrl-C still reaches them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PhaseGroup {
-    Inherited,
-    Own,
-}
-
 /// A running phase command with its output drains.
 struct PhaseProcess {
     child: Child,
@@ -1427,7 +1415,6 @@ fn spawn_phase(
     env: &BTreeMap<String, String>,
     log_line: LogLine,
     reboot: Option<&PhaseReboot>,
-    group: PhaseGroup,
 ) -> Result<PhaseProcess> {
     let mut process = match command {
         CommandValue::String(command) => shell_command(&shim_first(command, reboot)),
@@ -1439,12 +1426,6 @@ fn spawn_phase(
         .envs(env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    if group == PhaseGroup::Own {
-        process.process_group(0);
-    }
-    #[cfg(not(unix))]
-    let _ = group;
     let mut child = process
         .spawn()
         .map_err(|err| CliError::Operational(format!("run {phase} phase: {err}")))?;
@@ -1485,15 +1466,7 @@ async fn run_command(
     log_line: LogLine,
     reboot: Option<&PhaseReboot>,
 ) -> Result<()> {
-    let mut process = spawn_phase(
-        phase,
-        &command.value,
-        work_dir,
-        env,
-        log_line,
-        reboot,
-        PhaseGroup::Inherited,
-    )?;
+    let mut process = spawn_phase(phase, &command.value, work_dir, env, log_line, reboot)?;
     let status = if let Some(timeout) = command.timeout {
         if let Ok(status) = tokio::time::timeout(timeout, process.wait()).await {
             status
@@ -1518,10 +1491,16 @@ async fn run_command(
     }
 }
 
+/// A string command, run by the user's login shell.
+///
+/// Like every command built for an app, it leads its own process group: the shell may
+/// fork the command rather than exec it, and a stop, a grace-expiry kill or a timeout
+/// signals the group so it reaches the command whatever sits in between.
 #[cfg(unix)]
 fn shell_command(command: &str) -> Command {
     let mut process = Command::new(login_shell());
     process.arg("-l").arg("-c").arg(command);
+    process.process_group(0);
     process
 }
 
@@ -1637,6 +1616,10 @@ fn argv_command(argv: &[String], env: &BTreeMap<String, String>) -> Result<Comma
     for arg in &argv[1..] {
         process.arg(substitute_vars(arg, env)?);
     }
+    // Its own process group, like a string command's shell, so whatever the program
+    // starts is signalled along with it.
+    #[cfg(unix)]
+    process.process_group(0);
     Ok(process)
 }
 
@@ -2069,7 +2052,6 @@ async fn run_stop_command(
         &env.vars,
         Arc::clone(&ctx.log_line),
         reboot.as_ref(),
-        PhaseGroup::Own,
     );
     let Ok(mut phase) = spawned else {
         discard_phase_files(env);
@@ -2422,7 +2404,6 @@ pub async fn run_stopped_phase(
         &env.vars,
         Arc::clone(&ctx.log_line),
         reboot.as_ref(),
-        PhaseGroup::Own,
     );
     let Ok(mut phase) = spawned else {
         discard_phase_files(env);
@@ -2471,6 +2452,8 @@ pub async fn run_stopped_phase(
 mod tests {
     use super::*;
     use crate::app::StartPhase;
+    #[cfg(unix)]
+    use crate::process::grandchild::Grandchild;
 
     /// Discards drained phase output; for tests that assert non-log behavior.
     fn no_log() -> LogLine {
@@ -3939,6 +3922,129 @@ mod tests {
         assert_eq!(outcome.exit.code, None);
     }
 
+    /// A string command runs under the login shell and a forking wrapper behind it, as
+    /// it does for an account whose shell is `dash`: the stop signal reaches the process
+    /// the wrapper started, not only the wrapper.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_reaches_what_a_string_commands_shell_started() {
+        let env = StopEnv::new(serde_json::json!({
+            "start": {"command": "sh -c 'sleep 600 & echo $! > sleeper.pid; wait'"},
+            "stop": {"grace": "5s"}
+        }));
+        let mut app = env.start().await;
+        let sleeper = Grandchild::recorded_in(env.work.path()).await;
+        let outcome = env
+            .stop(&mut app, StopReason::Stop, &CancellationToken::new())
+            .await;
+
+        assert_eq!(outcome.how, StopHow::Graceful);
+        assert!(
+            sleeper.ends().await,
+            "the wrapper's child outlived the stop"
+        );
+    }
+
+    /// When nothing in the app acts on the stop signal, the kill at the end of the grace
+    /// period reaches the wrapper's child too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_grace_expiry_kill_reaches_what_a_string_commands_shell_started() {
+        let env = StopEnv::new(serde_json::json!({
+            "start": {"command": "trap '' TERM; sh -c 'sleep 600 & echo $! > sleeper.pid; wait'"},
+            "stop": {"grace": "1s"}
+        }));
+        let mut app = env.start().await;
+        let sleeper = Grandchild::recorded_in(env.work.path()).await;
+        let outcome = env
+            .stop(&mut app, StopReason::Stop, &CancellationToken::new())
+            .await;
+
+        assert_eq!(outcome.how, StopHow::Killed);
+        assert!(
+            sleeper.ends().await,
+            "the wrapper's child outlived the kill"
+        );
+    }
+
+    /// An argv command runs with no shell in between, and its stop reaches what it
+    /// started all the same.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_argv_app_runs_and_its_stop_reaches_what_it_started() {
+        let env = StopEnv::new(serde_json::json!({
+            "start": {"command": ["sh", "-c", "echo started; sleep 600 & echo $! > sleeper.pid; wait"]},
+            "stop": {"grace": "5s"}
+        }));
+        let mut app = env.start().await;
+        let sleeper = Grandchild::recorded_in(env.work.path()).await;
+        for _ in 0..250 {
+            if env
+                .lines
+                .lock()
+                .expect("lines")
+                .iter()
+                .any(|line| line == "started")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            env.lines
+                .lock()
+                .expect("lines")
+                .iter()
+                .any(|line| line == "started"),
+            "the argv app ran"
+        );
+        let outcome = env
+            .stop(&mut app, StopReason::Stop, &CancellationToken::new())
+            .await;
+
+        assert_eq!(outcome.how, StopHow::Graceful);
+        assert!(sleeper.ends().await, "the app's child outlived the stop");
+    }
+
+    /// A phase that runs past its timeout is killed with everything its shell started.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_phase_timeout_kills_what_its_shell_started() {
+        let env = StopEnv::new(serde_json::json!({
+            "install": {
+                "command": "sh -c 'sleep 600 & echo $! > sleeper.pid; wait'",
+                "timeout": "1s"
+            }
+        }));
+        let install = run_install_phase(
+            "demo",
+            "demo-1",
+            "1.0",
+            &env.config,
+            &env.params,
+            env.work.path(),
+            Some(&env.resolver),
+            Arc::clone(&env.log),
+            None,
+            None,
+        );
+        // A child left holding the phase's pipes would keep the phase from returning,
+        // so the wait is bounded rather than the test hanging for as long as it sleeps.
+        let (result, sleeper) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(30), install),
+            Grandchild::recorded_in(env.work.path())
+        );
+
+        let err = result
+            .expect("the phase returned once its timeout was up")
+            .expect_err("the install phase timed out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            sleeper.ends().await,
+            "the phase's child outlived the timeout"
+        );
+    }
+
     /// A stop command that fails has said nothing that keeps the app running.
     #[cfg(unix)]
     #[tokio::test]
@@ -4531,6 +4637,29 @@ mod tests {
             command.arg("-c").arg(script).current_dir(self.work.path());
             let sink = Arc::clone(&self.log);
             crate::process::spawn_app(command, move |stream, line| {
+                sink(stream, line);
+            })
+            .expect("spawn app")
+        }
+
+        /// Starts the app from its own `start.command`, through the same command
+        /// builder and spawn the runtime uses.
+        async fn start(&self) -> Child {
+            let start = start_command(
+                "demo",
+                "demo-1",
+                &self.config,
+                "1.0",
+                &self.params,
+                self.work.path(),
+                Some(&self.resolver),
+                None,
+                None,
+            )
+            .await
+            .expect("start command");
+            let sink = Arc::clone(&self.log);
+            crate::process::spawn_app(start.command, move |stream, line| {
                 sink(stream, line);
             })
             .expect("spawn app")

@@ -395,9 +395,13 @@ async fn command_probe(
         .spawn()
         .map_err(|err| format!("probe command failed to start: {err}"))?;
     let Ok(status) = tokio::time::timeout(timeout, child.wait()).await else {
-        // Nothing reaps an abandoned probe child, so a slow one must be killed
-        // before the next tick spawns its successor.
-        let _ = child.kill().await;
+        // Nothing reaps an abandoned probe child, so a slow one must be killed — with
+        // everything it started, through its process group — before the next tick
+        // spawns its successor.
+        crate::process::AppProcess::subprocess(&mut child, std::time::Instant::now())
+            .kill()
+            .await;
+        let _ = child.wait().await;
         return Err("probe command timed out".to_owned());
     };
     let status = status.map_err(|err| format!("probe command failed: {err}"))?;
@@ -1407,5 +1411,31 @@ mod tests {
         assert_eq!(transition.seq, 0);
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(rx.try_recv().is_err(), "an unprobed endpoint reports once");
+    }
+
+    /// A probe that runs past its timeout is killed with everything its shell started,
+    /// so a slow probe never leaves a process behind for every tick.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_probe_is_killed_with_what_its_shell_started() {
+        use crate::process::grandchild::Grandchild;
+
+        let dir = tempfile::tempdir().expect("work dir");
+        let ctx = ProbeContext {
+            work_dir: dir.path().to_path_buf(),
+            ..ProbeContext::default()
+        };
+        let command =
+            CommandValue::String("sh -c 'sleep 600 & echo $! > sleeper.pid; wait'".to_owned());
+        let (verdict, sleeper) = tokio::join!(
+            command_probe(&command, Duration::from_secs(1), &ctx),
+            Grandchild::recorded_in(dir.path())
+        );
+
+        assert_eq!(verdict, Err("probe command timed out".to_owned()));
+        assert!(
+            sleeper.ends().await,
+            "the probe's child outlived its timeout"
+        );
     }
 }
