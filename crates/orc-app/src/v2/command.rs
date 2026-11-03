@@ -11,12 +11,14 @@
 //!   packaged `.exe` runs directly; anything else is looked up in `PATH`. A leading `./`
 //!   (or `.\`) is accepted and names the app directory's file.
 //!
-//! On the `-File` form: Windows PowerShell binds each argument after the script path to
-//! the script's `param()` block. One element per flag — `-Url:value`, the value joined to
-//! the name by `:` — is what keeps a value that starts with `-`, or holds spaces, bound to
-//! its parameter rather than read as a parameter name of its own; the Windows CI suite
-//! runs a real script through this builder to pin down what arrives (see the
-//! `powershell_file_*` tests in `lifecycle`).
+//! On the `-File` form, as measured by the Windows CI suite running a real script through
+//! this builder (`powershell_file_binds_name_colon_value_elements` in `lifecycle`): Windows
+//! PowerShell 5.1 binds each `-Name:value` element after the script path to the script's
+//! `param()` block with the value intact — spaces, commas, a leading `-`, `$env:X`, single
+//! and double quotes, and a trailing backslash all arrive as written. The one exception is
+//! an **empty** value: `-Name:` leaves the parameter unbound, so the script sees its
+//! declared default (or `$null`, which a `[string]` reads as `""`). A manifest that must
+//! tell "set to empty" from "not given" on Windows cannot do it with `-Name:${x:-}`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -93,7 +95,9 @@ pub fn resolve_program(mut argv: Vec<String>, app_dir: &Path, host: CommandHost)
     match host {
         CommandHost::Unix => {
             if let Some(relative) = first.strip_prefix("./") {
-                argv[0] = app_dir.join(relative).display().to_string();
+                // Joined as Unix writes a path, whichever host computes it.
+                let dir = app_dir.display().to_string();
+                argv[0] = format!("{}/{relative}", dir.trim_end_matches('/'));
             }
             argv
         }

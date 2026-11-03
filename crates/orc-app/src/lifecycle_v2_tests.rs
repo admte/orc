@@ -709,7 +709,8 @@ $result | ConvertTo-Json -Compress | Set-Content -Path $Out -Encoding UTF8
 "#;
 
 /// What a `-Value:<value>` element arrives as in a `.ps1` run by the shorthand:
-/// Windows PowerShell 5.1's `-File` binding, measured on the Windows CI runner.
+/// Windows PowerShell 5.1's `-File` binding, measured on the Windows CI runner. Every
+/// value arrives as written except an empty one, which leaves the parameter unbound.
 #[cfg(windows)]
 #[tokio::test]
 async fn powershell_file_binds_name_colon_value_elements() {
@@ -726,7 +727,9 @@ async fn powershell_file_binds_name_colon_value_elements() {
         ("-Value:it's", "it's"),
         ("-Value:say \"hi\"", "say \"hi\""),
         ("-Value:trailing\\", "trailing\\"),
-        ("-Value:", ""),
+        // Measured: Windows PowerShell 5.1 drops an empty `-Name:` value, leaving the
+        // parameter at its declared default. Pinned here so a change is noticed.
+        ("-Value:", "<unbound>"),
     ];
     let mut report = Vec::new();
     for (index, (element, expected)) in cases.iter().enumerate() {
