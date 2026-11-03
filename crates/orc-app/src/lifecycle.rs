@@ -372,7 +372,7 @@ pub async fn start_command(
     )
     .await?;
     let mut process = match &command {
-        CommandValue::String(command) => shell_command(&shim_first(command, reboot)),
+        CommandValue::String(command) => shell_command(command, reboot),
         CommandValue::Argv(argv) => argv_command(argv, &env.vars)?,
     };
     apply_login_env(&mut process);
@@ -394,7 +394,7 @@ pub fn probe_command(
     env: &BTreeMap<String, String>,
 ) -> Result<Command> {
     let mut process = match command {
-        CommandValue::String(command) => shell_command(command),
+        CommandValue::String(command) => shell_command(command, None),
         CommandValue::Argv(argv) => argv_command(argv, env)?,
     };
     apply_login_env(&mut process);
@@ -1430,7 +1430,7 @@ fn spawn_phase(
     group: PhaseGroup,
 ) -> Result<PhaseProcess> {
     let mut process = match command {
-        CommandValue::String(command) => shell_command(&shim_first(command, reboot)),
+        CommandValue::String(command) => shell_command(command, reboot),
         CommandValue::Argv(argv) => argv_command(argv, env)?,
     };
     apply_login_env(&mut process);
@@ -1518,18 +1518,149 @@ async fn run_command(
     }
 }
 
+/// Runs a string command through the runtime user's login shell.
+///
+/// A simple command is run as `exec <command>`, so the login shell sources the profile
+/// and then replaces itself: the spawned child IS the app. Without it a shell that does
+/// not exec its last command (dash, the `/bin/sh` of shell-less accounts) stays alive as
+/// the app's parent, holding its pipes open after the app closes them and taking the
+/// signals meant for it. A compound command keeps the shell, since `exec a && b` would
+/// never run `b`.
 #[cfg(unix)]
-fn shell_command(command: &str) -> Command {
-    let mut process = Command::new(login_shell());
-    process.arg("-l").arg("-c").arg(command);
+fn shell_command(command: &str, reboot: Option<&PhaseReboot>) -> Command {
+    shell_command_in(&login_shell(), command, reboot)
+}
+
+#[cfg(unix)]
+fn shell_command_in(shell: &str, command: &str, reboot: Option<&PhaseReboot>) -> Command {
+    let command = if is_simple_command(command) {
+        format!("exec {command}")
+    } else {
+        command.to_owned()
+    };
+    let mut process = Command::new(shell);
+    process
+        .arg("-l")
+        .arg("-c")
+        .arg(shim_first(&command, reboot));
     process
 }
 
 #[cfg(windows)]
-fn shell_command(command: &str) -> Command {
+fn shell_command(command: &str, reboot: Option<&PhaseReboot>) -> Command {
     let mut process = Command::new("powershell");
-    process.arg("-Command").arg(command);
+    process.arg("-Command").arg(shim_first(command, reboot));
     process
+}
+
+/// Words that make a command something other than one program run with arguments when
+/// they lead it: shell keywords, and builtins (`exec`ing a builtin either fails or ends
+/// the shell before the builtin's effect could matter).
+#[cfg(unix)]
+const NOT_A_PROGRAM: &[&str] = &[
+    "!", "{", "}", "[[", "]]", "if", "then", "else", "elif", "fi", "case", "esac", "for", "select",
+    "while", "until", "do", "done", "in", "function", "time", "coproc", ":", ".", "source", "exec",
+    "eval", "command", "builtin", "exit", "return", "break", "continue", "export", "readonly",
+    "local", "declare", "typeset", "unset", "set", "shift", "trap", "cd", "pushd", "popd", "alias",
+    "unalias", "umask", "ulimit", "wait", "jobs", "fg", "bg", "disown", "let", "read", "hash",
+    "type", "getopts", "times", "shopt", "enable",
+];
+
+/// Whether a string command is certainly one simple command: a program and its
+/// arguments, nothing the shell would have to run after it.
+///
+/// Conservative by design — anything this cannot vouch for is "not simple" and keeps
+/// today's behaviour. Words are read with their quotes removed. It refuses:
+/// - outside quotes, any of `; & | ( ) < >`, a backtick, a newline or carriage return,
+///   `$(` or `$'`;
+/// - inside double quotes, a backtick, `$(`, a newline or carriage return;
+/// - an unterminated quote, or a backslash before a line end or at the very end;
+/// - a word that is exactly `{`, `}` or `!` anywhere;
+/// - a first word that is empty, starts with `#` or `-`, carries an `=` (a leading
+///   assignment) or is a keyword or builtin from [`NOT_A_PROGRAM`].
+#[cfg(unix)]
+fn is_simple_command(command: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote = Quote::None;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                } else {
+                    word.push(c);
+                }
+            }
+            Quote::Double => match c {
+                '"' => quote = Quote::None,
+                '`' | '\n' | '\r' => return false,
+                '$' if chars.peek() == Some(&'(') => return false,
+                '\\' => match chars.next() {
+                    Some('\n' | '\r') | None => return false,
+                    Some(next) => word.push(next),
+                },
+                _ => word.push(c),
+            },
+            Quote::None => match c {
+                ' ' | '\t' => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                ';' | '&' | '|' | '(' | ')' | '<' | '>' | '`' | '\n' | '\r' => return false,
+                // `$(` substitutes a command; `$'` quotes by rules this does not follow.
+                '$' if matches!(chars.peek(), Some(&('(' | '\''))) => return false,
+                '\'' => {
+                    quote = Quote::Single;
+                    in_word = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    in_word = true;
+                }
+                '\\' => match chars.next() {
+                    Some('\n' | '\r') | None => return false,
+                    Some(next) => {
+                        in_word = true;
+                        word.push(next);
+                    }
+                },
+                _ => {
+                    in_word = true;
+                    word.push(c);
+                }
+            },
+        }
+    }
+    if quote != Quote::None {
+        return false;
+    }
+    if in_word {
+        words.push(word);
+    }
+    let Some(first) = words.first() else {
+        return false;
+    };
+    if first.is_empty()
+        || first.starts_with(['#', '-'])
+        || first.contains('=')
+        || NOT_A_PROGRAM.contains(&first.as_str())
+    {
+        return false;
+    }
+    !words
+        .iter()
+        .any(|word| matches!(word.as_str(), "{" | "}" | "!"))
 }
 
 /// The passwd identity of the runtime user, used to give lifecycle
@@ -2909,8 +3040,160 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn one_program_with_arguments_is_a_simple_command() {
+        for command in [
+            "sh run.sh",
+            "./start-app --port 8080",
+            "/opt/app/bin/server",
+            "sh -c 'echo a; echo b | cat && true'",
+            "app \"--name=$NAME\" ${HOME}/data '$(not run)'",
+            "  run.sh\t--flag  ",
+            "app --x=1",
+            "app a\\;b",
+            "nohup app",
+            "app # trailing comment",
+        ] {
+            assert!(is_simple_command(command), "{command:?} is simple");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anything_the_shell_runs_after_the_program_is_not_simple() {
+        for command in [
+            "",
+            "   ",
+            "a; b",
+            "a && b",
+            "a || b",
+            "a | b",
+            "a &",
+            "a\nb",
+            "a\r\nb",
+            "(a)",
+            "{ a; }",
+            "a { b",
+            "! a",
+            "a `b`",
+            "a $(b)",
+            "a \"$(b)\"",
+            "a \"`b`\"",
+            "a $((1 + 2))",
+            "a > log",
+            "a < input",
+            "a 2>&1",
+            "a <(b)",
+            "a $'x\\'; b'",
+            "a 'unterminated",
+            "a \"unterminated",
+            "a \\",
+            "a \\\nb",
+            "FOO=1 app",
+            "FOO=1",
+            "if true",
+            "for x",
+            "while a",
+            "until a",
+            "case x",
+            "[[ -f x ]]",
+            "time app",
+            "exec app",
+            "cd /opt",
+            "export X",
+            ". ./env",
+            "source ./env",
+            ": noop",
+            "'cd' /opt",
+            "-x app",
+            "# comment only",
+        ] {
+            assert!(!is_simple_command(command), "{command:?} is not simple");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_simple_command_is_execed_and_a_compound_one_is_not() {
+        let script = |command: &str, reboot: Option<&PhaseReboot>| {
+            let process = shell_command_in("/bin/sh", command, reboot);
+            let args: Vec<_> = process.as_std().get_args().collect();
+            assert_eq!(&args[..2], ["-l", "-c"]);
+            args[2].to_string_lossy().into_owned()
+        };
+        assert_eq!(script("sh run.sh", None), "exec sh run.sh");
+        assert_eq!(script("a && b", None), "a && b");
+        // The shim assignment still runs after the profile, and the exec after it.
+        let state = tempfile::tempdir().expect("state dir");
+        let reboot = PhaseReboot::enter(state.path(), "demo", "1.0", "install").expect("enter");
+        assert!(script("shutdown -r now", Some(&reboot)).ends_with("\nexec shutdown -r now"));
+    }
+
+    /// The `/bin/sh` fallback (dash on Debian and Ubuntu) forks a `-c` command instead
+    /// of becoming it. The exec prefix makes the spawned child the app itself, so the app
+    /// closing its stdout reaches the reader as EOF while the app keeps running.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn under_bin_sh_the_spawned_child_is_the_app_and_its_stdout_close_is_seen() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+        let mut process =
+            shell_command_in("/bin/sh", "sh -c 'echo $$; exec >&-; exec sleep 30'", None);
+        process
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = process.spawn().expect("spawn");
+        let pid = child.id().expect("child pid");
+        let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut line))
+            .await
+            .expect("the app reports its pid in time")
+            .expect("read pid line");
+        assert_eq!(
+            line.trim(),
+            pid.to_string(),
+            "the app's own pid is the spawned child's pid"
+        );
+
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), stdout.read_to_end(&mut rest))
+            .await
+            .expect("the app closing stdout reaches the reader as EOF at once")
+            .expect("read to EOF");
+        assert_eq!(read, 0);
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "the app keeps running after closing its stdout"
+        );
+        // The app execs `sleep` right after closing stdout; give that exec a moment.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let argv0 = loop {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).expect("read cmdline");
+            let argv0 = cmdline
+                .split(|byte| *byte == 0)
+                .next()
+                .unwrap_or_default()
+                .to_vec();
+            if argv0 == b"sleep" || tokio::time::Instant::now() > deadline {
+                break argv0;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&argv0),
+            "sleep",
+            "the spawned child is the app, not a shell"
+        );
+
+        child.kill().await.expect("kill the app");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn phase_commands_carry_a_login_environment() {
-        let mut process = shell_command("true");
+        let mut process = shell_command("true", None);
         apply_login_env(&mut process);
         let std_command = process.as_std();
         let args: Vec<_> = std_command.get_args().collect();
