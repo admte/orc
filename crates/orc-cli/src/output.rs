@@ -131,6 +131,10 @@ pub fn print_info(info: &InfoDocument, format: OutputFormat) -> Result<()> {
                 println!("{}", info.description);
             }
             println!("Platforms: {}", info.platforms.join(", "));
+            println!("Format:    {}", info.format);
+            if let Some(platform) = &info.config_platform {
+                println!("Shown for: {platform}");
+            }
             println!("Mode:      {}", info.mode);
             println!("Phases:    {}", info.phases.join(", "));
             if !info.params.is_empty() {

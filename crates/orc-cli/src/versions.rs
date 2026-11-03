@@ -62,7 +62,9 @@ pub async fn read_manifest_summary(
     };
     let doc = ManifestDocument::parse(&response.body, &response.content_type)
         .map_err(|err| CliError::Operational(format!("decode manifest: {err}")))?;
-    if !doc.is_orc_app() {
+    // An app of a format this orc does not run is refused by name, not passed over as
+    // something other than an app.
+    if doc.app_format()?.is_none() {
         return Ok(None);
     }
     let config = registry.app_config_for_manifest(repository, &doc).await?;
@@ -73,6 +75,28 @@ pub async fn read_manifest_summary(
         description: doc.description(),
         platforms,
     }))
+}
+
+/// The app config `reference` serves this host's platform (its first platform when it
+/// has none for this host), with that platform's label.
+pub async fn read_platform_config(
+    registry: &RegistryClient,
+    repository: &str,
+    reference: &str,
+) -> Result<Option<(AppConfig, String)>> {
+    let response = match registry.get_manifest(repository, reference).await {
+        Ok(response) => response,
+        Err(CliError::NotFound(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let doc = ManifestDocument::parse(&response.body, &response.content_type)
+        .map_err(|err| CliError::Operational(format!("decode manifest: {err}")))?;
+    if doc.app_format()?.is_none() {
+        return Ok(None);
+    }
+    registry
+        .app_config_for_platform(repository, &doc, &crate::cli::host_platform_label())
+        .await
 }
 
 pub async fn discover_versions(

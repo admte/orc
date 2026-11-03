@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use serde::Serialize;
 
-use crate::app::{AppConfig, CommandValue};
+use crate::app::{AppConfig, AppFormat, CommandValue};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InfoDocument {
@@ -10,6 +10,13 @@ pub struct InfoDocument {
     pub digest: String,
     pub description: String,
     pub platforms: Vec<String>,
+    /// The app format, `v1` or `v2` (spec 214).
+    pub format: String,
+    /// Whose config the mode and phases describe: a platform label, or `any` for a
+    /// single-manifest package. A v2 app's commands are resolved per platform, so they
+    /// read as that platform's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_platform: Option<String>,
     pub mode: String,
     pub phases: Vec<String>,
     pub params: Vec<ParamInfo>,
@@ -42,6 +49,11 @@ pub fn build_info_document(
         digest,
         description,
         platforms,
+        format: config
+            .map_or(AppFormat::V1, |config| config.format)
+            .label()
+            .to_owned(),
+        config_platform: None,
         mode,
         phases,
         params,
@@ -78,7 +90,11 @@ fn mode(config: &AppConfig) -> String {
         return "none".to_owned();
     };
     if let Some(service) = &start.service {
-        let owner = if start.command.is_some() {
+        let has_command = match (config.format, &start.command) {
+            (AppFormat::V2, Some(CommandValue::Argv(argv))) => !argv.is_empty(),
+            (_, command) => command.is_some(),
+        };
+        let owner = if has_command {
             "runtime-managed"
         } else {
             "bring-your-own"
@@ -95,16 +111,18 @@ fn mode(config: &AppConfig) -> String {
 }
 
 fn phases(config: &AppConfig) -> Vec<String> {
+    let format = config.format;
     let mut phases = Vec::new();
     if let Some(phase) = &config.install {
         phases.push(command_phase(
+            format,
             "install",
             phase.timeout.as_deref(),
             phase.command.as_ref(),
         ));
     }
     if let Some(start) = &config.start {
-        let mut label = command_phase("start", None, start.command.as_ref());
+        let mut label = command_phase(format, "start", None, start.command.as_ref());
         if let Some(restart) = &start.restart {
             let _ = write!(label, " restart={restart}");
         }
@@ -120,11 +138,12 @@ fn phases(config: &AppConfig) -> Vec<String> {
             stop.timeout.as_deref().unwrap_or("30s"),
             stop.grace.as_deref().unwrap_or("10s")
         );
-        append_command(&mut label, stop.command.as_ref());
+        append_command(format, &mut label, stop.command.as_ref());
         phases.push(label);
     }
     if let Some(phase) = &config.stopped {
         phases.push(command_phase(
+            format,
             "stopped",
             phase.timeout.as_deref(),
             phase.command.as_ref(),
@@ -132,6 +151,7 @@ fn phases(config: &AppConfig) -> Vec<String> {
     }
     if let Some(phase) = &config.uninstall {
         phases.push(command_phase(
+            format,
             "uninstall",
             phase.timeout.as_deref(),
             phase.command.as_ref(),
@@ -140,17 +160,40 @@ fn phases(config: &AppConfig) -> Vec<String> {
     phases
 }
 
-fn command_phase(name: &str, timeout: Option<&str>, command: Option<&CommandValue>) -> String {
+fn command_phase(
+    format: AppFormat,
+    name: &str,
+    timeout: Option<&str>,
+    command: Option<&CommandValue>,
+) -> String {
     let mut label = name.to_owned();
     if let Some(timeout) = timeout {
         let _ = write!(label, " ({timeout})");
     }
-    append_command(&mut label, command);
+    append_command(format, &mut label, command);
     label
 }
 
-/// Notes how a phase's command is written, without quoting the command itself.
-fn append_command(label: &mut String, command: Option<&CommandValue>) {
+/// Notes how a phase's command is written. A v1 command is not quoted — a string runs a
+/// shell and may carry anything. A v2 command is shown as resolved for its platform: it
+/// is an argv list whose secrets are only ever `${name_file}` paths, so what runs can be
+/// read straight off it.
+fn append_command(format: AppFormat, label: &mut String, command: Option<&CommandValue>) {
+    if format == AppFormat::V2 {
+        match command {
+            Some(CommandValue::Argv(argv)) if argv.is_empty() => label.push_str(" [skipped]"),
+            Some(CommandValue::Argv(argv)) => {
+                let _ = write!(
+                    label,
+                    " {}",
+                    serde_json::to_string(argv).unwrap_or_default()
+                );
+            }
+            Some(CommandValue::String(_)) => label.push_str(" [string: not run by v2]"),
+            None => {}
+        }
+        return;
+    }
     match command {
         Some(CommandValue::String(command)) => {
             if !command.is_empty() {
