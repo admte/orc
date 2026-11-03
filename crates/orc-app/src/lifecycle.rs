@@ -315,7 +315,7 @@ pub async fn run_uninstall_phase(
             reboot,
             declared_service(config),
         )?),
-        AppFormat::V2 => durable_phase_env_v2(config, version, instance, params, reboot)?,
+        AppFormat::V2 => durable_phase_env_v2(config, version, instance, params, reboot, work_dir)?,
     };
     let result = run_command(
         "uninstall",
@@ -328,9 +328,13 @@ pub async fn run_uninstall_phase(
         interrupt,
     )
     .await;
-    // The files a v2 uninstall wrote for its file-backed params live for the phase only.
+    // The files a v2 uninstall wrote for its file-backed params live for the phase only,
+    // and so does the private directory they were written in.
     for path in env.startup_files.iter().chain(&env.param_files) {
         let _ = std::fs::remove_file(path);
+    }
+    if config.format == AppFormat::V2 {
+        let _ = std::fs::remove_dir_all(work_dir.join(UNINSTALL_PARAM_DIR));
     }
     let outcome = phase_outcome(reboot, &result)?;
     result?;
@@ -1608,8 +1612,10 @@ fn durable_phase_env_v2(
     instance: &str,
     params: &BTreeMap<String, String>,
     reboot: Option<&PhaseReboot>,
+    work_dir: &Path,
 ) -> Result<PhaseEnv> {
     let declared = config.params.as_ref().map(|params| &params.properties);
+    let mut private_dir = None;
     let property = |name: &str| declared.and_then(|properties| properties.get(name));
     let mut env = PhaseEnv::default();
     apply_reboot_env(&mut env.vars, reboot);
@@ -1623,7 +1629,13 @@ fn durable_phase_env_v2(
             continue;
         }
         if property(name).is_some_and(crate::params::is_file_backed_v2) {
-            let path = write_param_file(None, name, value.as_bytes())?;
+            let dir = match &private_dir {
+                Some(dir) => dir,
+                None => {
+                    private_dir.insert(prepare_private_dir(&work_dir.join(UNINSTALL_PARAM_DIR))?)
+                }
+            };
+            let path = write_param_file(Some(dir), name, value.as_bytes())?;
             env.tokens
                 .insert(format!("{name}_file"), path.display().to_string());
             env.param_files.push(path);
@@ -1822,9 +1834,22 @@ fn declared_service(config: &AppConfig) -> Option<&str> {
 
 /// Recreates `{work_dir}/.orc-params` (0700) for a fresh start.
 fn prepare_param_dir(work_dir: &Path) -> Result<PathBuf> {
-    let dir = param_files_dir(work_dir);
+    prepare_private_dir(&param_files_dir(work_dir))
+}
+
+/// Recreates `dir` empty and owner-only (0700).
+fn prepare_private_dir(dir: &Path) -> Result<PathBuf> {
+    let dir = dir.to_path_buf();
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&dir)
         .map_err(|err| CliError::Operational(format!("create {}: {err}", dir.display())))?;
     set_private_dir(&dir)?;
     Ok(dir)
@@ -1843,11 +1868,36 @@ fn write_param_file(param_dir: Option<&Path>, name: &str, bytes: &[u8]) -> Resul
             now.as_nanos()
         ))
     };
-    std::fs::write(&path, bytes)
-        .map_err(|err| CliError::Operational(format!("write {}: {err}", path.display())))?;
-    set_private_file(&path)?;
+    write_owner_only(&path, bytes)?;
     Ok(path)
 }
+
+/// Writes `bytes` to `path` as a file only its owner can read from the moment it exists:
+/// created with mode `0600` rather than written under the umask and narrowed afterwards,
+/// and created new — every caller writes a uniquely named file in the shared temp
+/// directory or a name in a private directory it has just recreated — so an existing file
+/// or link at the path is refused, never written through.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|err| CliError::Operational(format!("write {}: {err}", path.display())))?;
+    file.write_all(bytes)
+        .map_err(|err| CliError::Operational(format!("write {}: {err}", path.display())))?;
+    drop(file);
+    Ok(())
+}
+
+/// Where a v2 uninstall writes the kept values of its file-backed params: a private
+/// directory inside the app's work directory, removed after the phase.
+const UNINSTALL_PARAM_DIR: &str = ".orc-uninstall-params";
 
 #[cfg(unix)]
 fn set_private_dir(path: &Path) -> Result<()> {
