@@ -6,7 +6,10 @@
 //! - every token names a build var, a declared param, a file-backed param's `_file` form,
 //!   or a context name available where it is used, and every `${` is closed;
 //! - no two of those share a name, and no param's `_file` form collides with another;
-//! - a file-backed param is never referenced by its value token;
+//! - a file-backed param (marked `sensitive` or setting `contentMediaType`, nothing
+//!   else) is never referenced by its value token;
+//! - a param filled by an `x-source` kind the catalog declares sensitive
+//!   ([`crate::params::SOURCE_KINDS`]) is marked `sensitive`;
 //! - a per-OS map uses only the OS keys, and only on string or list fields — and none is
 //!   left in a built config;
 //! - every command is an argv list;
@@ -184,9 +187,7 @@ struct Names {
 
 impl Names {
     fn file_backed(&self, name: &str) -> Option<bool> {
-        self.params
-            .get(name)
-            .map(crate::params::is_file_backed_property)
+        self.params.get(name).map(crate::params::is_file_backed_v2)
     }
 }
 
@@ -276,6 +277,7 @@ impl Checker<'_> {
             persists: config.persist.is_some(),
         };
         self.collisions(&names);
+        self.sensitive_sources(&names);
         let phases = [
             (
                 Phase::Install,
@@ -329,6 +331,31 @@ impl Checker<'_> {
             .and_then(|start| start.service.as_ref())
         {
             self.element(&names, Phase::Service, "start.service".to_owned(), service);
+        }
+    }
+
+    /// A param filled by a kind the catalog calls sensitive must be marked `sensitive`:
+    /// the catalog guards what the manifest decides (spec 214 *Publish checks*). A kind
+    /// this build does not know is not judged here.
+    fn sensitive_sources(&mut self, names: &Names) {
+        for (name, property) in &names.params {
+            let Some(source) = &property.x_source else {
+                continue;
+            };
+            let credential =
+                crate::params::source_kind(&source.kind).is_some_and(|kind| kind.sensitive);
+            if credential && !property.sensitive {
+                self.refuse(
+                    format!("params.properties.{name}"),
+                    None,
+                    None,
+                    format!(
+                        "param `{name}` is filled by source kind `{}`, which yields a \
+                         credential; mark it `sensitive: true`",
+                        source.kind
+                    ),
+                );
+            }
         }
     }
 
@@ -672,19 +699,87 @@ mod tests {
             found.contains("${token} is the value of file-backed param"),
             "{found}"
         );
-        // Source kinds delivered as files are file-backed too.
-        for kind in ["peers.all", "tls.key"] {
-            let found = one(serde_json::json!({
+        // No source kind makes a param file-backed: only `sensitive` and
+        // `contentMediaType` do.
+        for kind in ["peers.all", "tls.cert", "ca.bundle"] {
+            let config = serde_json::json!({
                 "params": {"properties": {"peers": {"type": "string", "x-source": {"kind": kind}}}},
                 "install": {"command": ["./run.sh", "${peers}"]}
+            });
+            assert!(
+                refusals(config, "linux", &[("run.sh", true)]).is_empty(),
+                "{kind} is a value token"
+            );
+            let found = one(serde_json::json!({
+                "params": {"properties": {"peers": {"type": "string", "x-source": {"kind": kind}}}},
+                "install": {"command": ["./run.sh", "${peers_file}"]}
             }));
-            assert!(found.contains("file-backed"), "{kind}: {found}");
+            assert!(found.contains("is not file-backed"), "{kind}: {found}");
         }
+        // A sensitive kind's param, marked sensitive as it must be, is file-backed by that.
+        let found = one(serde_json::json!({
+            "params": {"properties": {"key": {"type": "string", "sensitive": true, "x-source": {"kind": "tls.key"}}}},
+            "install": {"command": ["./run.sh", "${key}"]}
+        }));
+        assert!(
+            found.contains("${key} is the value of file-backed param"),
+            "{found}"
+        );
         let found = one(serde_json::json!({
             "params": {"properties": {"doc": {"type": "string", "contentMediaType": "application/json"}}},
             "install": {"command": ["./run.sh", "${doc}"]}
         }));
         assert!(found.contains("file-backed"), "{found}");
+    }
+
+    /// The kind catalog guards the manifest: a param filled by a kind that yields a
+    /// credential must say it is sensitive, and the refusal names the param and the kind.
+    #[test]
+    fn a_param_from_a_sensitive_kind_must_be_marked_sensitive() {
+        for kind in ["tls.key", "github.runner"] {
+            let found = one(serde_json::json!({
+                "params": {"properties": {"secret": {"type": "string", "x-source": {"kind": kind}}}},
+                "install": {"command": ["./run.sh", "--secret=${secret}"]}
+            }));
+            assert!(
+                found.contains(&format!(
+                    "params.properties.secret: param `secret` is filled by source kind `{kind}`, \
+                     which yields a credential; mark it `sensitive: true`"
+                )),
+                "{kind}: {found}"
+            );
+            let config = serde_json::json!({
+                "params": {"properties": {"secret": {"type": "string", "sensitive": true, "x-source": {"kind": kind}}}},
+                "install": {"command": ["./run.sh", "--secret-file=${secret_file}"]}
+            });
+            assert!(
+                refusals(config, "linux", &[("run.sh", true)]).is_empty(),
+                "{kind}"
+            );
+        }
+        // Every other kind in the catalog is not a credential, and a kind this build does
+        // not know is not judged.
+        for kind in crate::params::SOURCE_KINDS
+            .iter()
+            .filter(|kind| !kind.sensitive)
+            .map(|kind| kind.name)
+            .chain(["some.future.kind"])
+        {
+            let config = serde_json::json!({
+                "params": {"properties": {"value": {"type": "string", "x-source": {"kind": kind}}}},
+                "install": {"command": ["./run.sh", "${value}"]}
+            });
+            assert!(
+                refusals(config, "linux", &[("run.sh", true)]).is_empty(),
+                "{kind}"
+            );
+        }
+        let sensitive: Vec<&str> = crate::params::SOURCE_KINDS
+            .iter()
+            .filter(|kind| kind.sensitive)
+            .map(|kind| kind.name)
+            .collect();
+        assert_eq!(sensitive, ["tls.key", "github.runner"]);
     }
 
     #[test]

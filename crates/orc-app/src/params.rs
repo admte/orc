@@ -6,28 +6,87 @@ use serde_json::Value;
 use crate::app::{ParamLifetime, ParamProperty, ParamSchema};
 use crate::error::{CliError, Result};
 
-/// Source kinds whose host-filled value is a secret in its own right: a private key, a
-/// CI runner's registration credential.
-const SECRET_SOURCE_KINDS: &[&str] = &["tls.key", "github.runner"];
+/// One `x-source` kind this build of orc knows, and what the catalog says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceKind {
+    pub name: &'static str,
+    /// The kind yields a credential: a private key, a CI runner's registration token. A
+    /// format v2 param it fills must be marked `sensitive` (spec 214 *Publish checks*):
+    /// the catalog guards what the manifest decides, and never decides it itself.
+    pub sensitive: bool,
+}
 
+/// The `x-source` kinds this build of orc knows (spec 142 *Orchestrator-Sourced Values*).
+pub const SOURCE_KINDS: &[SourceKind] = &[
+    SourceKind {
+        name: "peers.gossip",
+        sensitive: false,
+    },
+    SourceKind {
+        name: "peers.all",
+        sensitive: false,
+    },
+    SourceKind {
+        name: "peers.first",
+        sensitive: false,
+    },
+    SourceKind {
+        name: "peers.any",
+        sensitive: false,
+    },
+    SourceKind {
+        name: "pool.slot",
+        sensitive: false,
+    },
+    SourceKind {
+        name: "pool.name",
+        sensitive: false,
+    },
+    SourceKind {
+        name: "ca.bundle",
+        sensitive: false,
+    },
+    SourceKind {
+        name: "tls.cert",
+        sensitive: false,
+    },
+    SourceKind {
+        name: "tls.key",
+        sensitive: true,
+    },
+    SourceKind {
+        name: "github.runner",
+        sensitive: true,
+    },
+];
+
+/// The catalog entry for `kind`, when this build knows it.
+#[must_use]
+pub fn source_kind(kind: &str) -> Option<&'static SourceKind> {
+    SOURCE_KINDS.iter().find(|entry| entry.name == kind)
+}
+
+/// Format v1: a param filled by a kind the catalog calls sensitive is sensitive whether or
+/// not its manifest says so (spec 142).
 fn is_implicitly_sensitive(property: &ParamProperty) -> bool {
     property
         .x_source
         .as_ref()
-        .is_some_and(|source| SECRET_SOURCE_KINDS.contains(&source.kind.as_str()))
+        .and_then(|source| source_kind(&source.kind))
+        .is_some_and(|kind| kind.sensitive)
 }
 
-/// Whether a param reaches a phase as a file rather than as a value: it is `sensitive`
-/// (declared, or implicitly by a secret source kind), sets `contentMediaType`, or is
-/// filled by a source kind delivered as a file (`peers.all`, `tls.key`).
-///
-/// One definition for the runtime and the format v2 publish checks, so a command the
-/// checker admits is one the runtime can fill.
+/// Format v2: whether a param reaches a phase as a file rather than as a value. When, and
+/// only when, its manifest marks it `sensitive` or sets `contentMediaType` (spec 214
+/// *Tokens*); no `x-source` kind changes that. One definition for the runtime and the
+/// publish checks, so a command the checker admits is one the runtime can fill.
 #[must_use]
-pub fn is_file_backed_property(property: &ParamProperty) -> bool {
-    is_file_backed(property)
+pub fn is_file_backed_v2(property: &ParamProperty) -> bool {
+    property.sensitive || property.content_media_type.is_some()
 }
 
+/// Format v1's file-backed rule (spec 142): the manifest's word, plus the source kinds
+/// 142 delivers as files.
 fn is_file_backed(property: &ParamProperty) -> bool {
     property.sensitive
         || property.content_media_type.is_some()

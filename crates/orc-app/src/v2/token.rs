@@ -180,6 +180,18 @@ pub fn substitute<'v>(
     Ok(Some(out))
 }
 
+/// The first token in `element` that `lookup` leaves unset and that carries no default,
+/// as written (`${pool}`): what made [`substitute`] drop the element. `None` when the
+/// element is complete, or not valid syntax.
+pub fn first_unset<'a, 'v>(
+    element: &'a str,
+    lookup: impl Fn(&str) -> Option<&'v str>,
+) -> Option<&'a str> {
+    tokens(element).ok()?.into_iter().find_map(|token| {
+        (lookup(token.name).is_none() && token.default.is_none()).then_some(token.raw)
+    })
+}
+
 /// Resolves an argv list against `values`: each element becomes exactly one argument or,
 /// when it names an unset value with no default, none at all.
 ///
@@ -314,6 +326,14 @@ mod tests {
         assert!(matches!(parse("${a b}"), Err(TokenError::BadName { .. })));
         // Braces alone are text in v2.
         assert_eq!(resolve("{os}", &[]).as_deref(), Some("{os}"));
+    }
+
+    #[test]
+    fn first_unset_names_the_token_that_drops_an_element() {
+        let values = values(&[("a", "1")]);
+        let lookup = |name: &str| values.get(name).map(String::as_str);
+        assert_eq!(first_unset("${a}-${b:-x}-${c}", lookup), Some("${c}"));
+        assert_eq!(first_unset("${a}-${b:-x}", lookup), None);
     }
 
     #[test]

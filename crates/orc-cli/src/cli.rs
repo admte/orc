@@ -3966,7 +3966,7 @@ fn uninstall_params(
             );
             continue;
         };
-        if orc_app::params::is_file_backed_property(property) {
+        if orc_app::params::is_file_backed_v2(property) {
             let dir = work_dir.join(UNINSTALL_FILES_DIR);
             let path = write_owner_only(&dir, name, &bytes)?;
             params.insert(format!("{name}_file"), path.display().to_string());

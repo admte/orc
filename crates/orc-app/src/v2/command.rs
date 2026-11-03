@@ -76,8 +76,11 @@ pub fn command_argv(
         .map_err(|err| CliError::Operational(format!("lifecycle command: {err}")))?;
     let mut elements = substituted.into_iter();
     let Some(program) = elements.next().flatten() else {
+        let token = token::first_unset(&template[0], |name| tokens.get(name).map(String::as_str))
+            .unwrap_or_default();
         return Err(CliError::Operational(format!(
-            "lifecycle command's program {:?} names a value that is not set",
+            "lifecycle command's program {:?}: {token} is not set, and a program cannot be \
+             dropped",
             template[0]
         )));
     };
