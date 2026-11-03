@@ -317,13 +317,9 @@ fn signal_tree(child: &Child, signal: i32) {
     };
     // A child that has already ended is not a failure to report: there is nothing
     // left to end.
-    if !sent && !is_gone() {
-        tracing::warn!(
-            pid,
-            signal,
-            error = %std::io::Error::last_os_error(),
-            "app could not be signalled"
-        );
+    let errno = last_errno();
+    if !sent && errno != libc::ESRCH {
+        tracing::warn!(pid, signal, errno, "app could not be signalled");
     }
 }
 
@@ -331,7 +327,13 @@ fn signal_tree(child: &Child, signal: i32) {
 /// means there is nothing left to end.
 #[cfg(unix)]
 fn is_gone() -> bool {
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    last_errno() == libc::ESRCH
+}
+
+/// The errno the last failed call left.
+#[cfg(unix)]
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 /// Windows has no process groups a runtime can signal, so the whole tree is ended
