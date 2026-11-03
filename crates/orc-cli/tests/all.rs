@@ -8,6 +8,8 @@ mod cli;
 mod config;
 #[path = "all/discovery.rs"]
 mod discovery;
+#[path = "all/format_v2.rs"]
+mod format_v2;
 #[path = "all/lifecycle.rs"]
 mod lifecycle;
 #[path = "all/list.rs"]

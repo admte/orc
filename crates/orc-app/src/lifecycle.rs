@@ -5558,3 +5558,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_v2_tests.rs"]
+mod v2_tests;

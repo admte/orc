@@ -1254,4 +1254,99 @@ files:
             "unexpected error: {err:?}"
         );
     }
+
+    /// The boot-seed builder builds a v2 recipe as `orc build` does: one config blob per
+    /// platform holding that platform's plain values, typed v2, and the publish checks
+    /// run on each.
+    #[tokio::test]
+    async fn a_v2_recipe_builds_one_resolved_config_per_platform() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("artifact.yaml"),
+            r#"artifactType: application/vnd.orc8r.app.v2
+config:
+  params: {type: object, properties: {url: {type: string}}}
+  start:
+    command:
+      unix: ["/bin/run-${arch}", "--url=${url}", "--v=${tag}"]
+      windows: ["run.ps1", "-Url:${url}"]
+  stop: {command: {windows: [], default: ["/bin/stop"]}}
+files:
+  - path: "data-${os}.txt"
+platforms:
+  - {os: linux, arch: arm64, vars: {tag: "a$b"}}
+  - {os: windows, arch: amd64, vars: {tag: "w"}}
+"#,
+        )
+        .expect("recipe");
+        std::fs::write(dir.path().join("data-linux.txt"), "l").expect("linux data");
+        std::fs::write(dir.path().join("data-windows.txt"), "w").expect("windows data");
+        let artifact = build_artifact(
+            dir.path(),
+            &[],
+            None,
+            BuildOptions::default(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("build");
+        let configs: Vec<JsonValue> = artifact
+            .manifests
+            .iter()
+            .filter_map(|manifest| {
+                let body: JsonValue = serde_json::from_slice(&manifest.body).ok()?;
+                let config = body.get("config")?;
+                assert_eq!(body["artifactType"], APP_V2_ARTIFACT_TYPE);
+                assert_eq!(config["mediaType"], APP_V2_CONFIG_MEDIA_TYPE);
+                let digest = config["digest"].as_str()?;
+                let blob = artifact.blobs.iter().find(|blob| blob.digest == digest)?;
+                serde_json::from_slice(&blob.body).ok()
+            })
+            .collect();
+        assert_eq!(configs.len(), 2);
+        let linux = configs
+            .iter()
+            .find(|config| config["start"]["command"][0] == "/bin/run-arm64")
+            .expect("linux config");
+        assert_eq!(
+            linux["start"]["command"],
+            serde_json::json!(["/bin/run-arm64", "--url=${url}", "--v=a$$b"])
+        );
+        assert_eq!(linux["stop"]["command"], serde_json::json!(["/bin/stop"]));
+        let windows = configs
+            .iter()
+            .find(|config| config["start"]["command"][0] == "run.ps1")
+            .expect("windows config");
+        // `windows: []` skips the stop command there.
+        assert_eq!(windows["stop"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_v2_recipe_refused_by_the_publish_checks_does_not_build() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("artifact.yaml"),
+            r#"artifactType: application/vnd.orc8r.app.v2
+config:
+  install: {command: ["installer", "--when=${pid}"]}
+platforms:
+  - {os: linux, arch: amd64}
+"#,
+        )
+        .expect("recipe");
+        let err = build_artifact(
+            dir.path(),
+            &[],
+            None,
+            BuildOptions::default(),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect_err("refused");
+        assert!(
+            err.to_string()
+                .contains("linux/amd64: install.command[1] \"--when=${pid}\": ${pid} is not available in install"),
+            "{err}"
+        );
+    }
 }
