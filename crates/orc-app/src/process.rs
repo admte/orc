@@ -286,12 +286,15 @@ fn service_exit_status(status: &ServiceStatus) -> ExitStatus {
     }
 }
 
-/// Sends `signal` to a still-running child's process group, or to the child alone when
-/// it does not lead one.
+/// Sends `signal` to the process group a child leads, or to the child alone when it
+/// leads none.
 ///
-/// The group check is load-bearing, not defensive: a child that is not a group leader
-/// shares the runtime's own group, and `kill(-pgid)` on that group would signal the
-/// runtime along with every other app it supervises.
+/// Every app and phase command leads its own group (see [`crate::lifecycle`]'s command
+/// builders), so this reaches whatever a wrapper started — a login shell's forked child
+/// included. `killpg` only ever addresses the group the child itself leads: for a child
+/// that leads none it fails with `ESRCH` and never reaches the runtime's own group, and
+/// the signal then goes to the child alone. A process that called `setsid` or moved to
+/// another group has left on purpose and is not followed.
 #[cfg(unix)]
 fn signal_tree(child: &Child, signal: i32) {
     let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) else {
@@ -300,15 +303,35 @@ fn signal_tree(child: &Child, signal: i32) {
         return;
     };
     // SAFETY: both calls take a pid by value and have no memory preconditions. The
-    // child is still owned here, so the pid has not been recycled.
+    // child is still owned here, so neither its pid nor the group it leads can have
+    // been recycled.
     #[allow(unsafe_code)]
-    unsafe {
-        if libc::getpgid(pid) == pid {
-            libc::kill(-pid, signal);
+    let sent = unsafe {
+        if libc::killpg(pid, signal) == 0 {
+            true
+        } else if is_gone() {
+            libc::kill(pid, signal) == 0
         } else {
-            libc::kill(pid, signal);
+            false
         }
+    };
+    // A child that has already ended is not a failure to report: there is nothing
+    // left to end.
+    if !sent && !is_gone() {
+        tracing::warn!(
+            pid,
+            signal,
+            error = %std::io::Error::last_os_error(),
+            "app could not be signalled"
+        );
     }
+}
+
+/// Whether the last failed call found no such process or group, which for a signal
+/// means there is nothing left to end.
+#[cfg(unix)]
+fn is_gone() -> bool {
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 /// Windows has no process groups a runtime can signal, so the whole tree is ended
@@ -609,5 +632,80 @@ mod tests {
         let term = classify_child_exit(ExitStatus::from_raw(15));
         assert_eq!(term.cause, "signal");
         assert_eq!(term.reason, "killed by signal 15");
+    }
+}
+
+/// Watching a process an app started behind its wrapper — the `sleep` a shell forked —
+/// for tests that check a stop or a kill reached it.
+#[cfg(all(test, unix))]
+pub(crate) mod grandchild {
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// The file a test command writes its background child's pid to, under the work
+    /// directory: `sh -c 'sleep 600 & echo $! > sleeper.pid; wait'`.
+    pub(crate) const PID_FILE: &str = "sleeper.pid";
+
+    /// A grandchild by pid. Dropping it kills it, so a failing test leaves nothing
+    /// running behind it.
+    pub(crate) struct Grandchild(i32);
+
+    impl Grandchild {
+        /// Waits for the test command to record its background child.
+        pub(crate) async fn recorded_in(dir: &Path) -> Self {
+            let file = dir.join(PID_FILE);
+            for _ in 0..250 {
+                if let Some(pid) = std::fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                {
+                    return Self(pid);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("{} was never written", file.display());
+        }
+
+        /// Whether the process has ended within a few seconds. A zombie has ended: it
+        /// only waits for whoever inherited it to read its status.
+        pub(crate) async fn ends(&self) -> bool {
+            for _ in 0..250 {
+                if !self.running() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        }
+
+        fn running(&self) -> bool {
+            // SAFETY: signal 0 only checks the pid exists; it takes no memory.
+            #[allow(unsafe_code)]
+            let exists = unsafe { libc::kill(self.0, 0) } == 0;
+            exists && !self.is_zombie()
+        }
+
+        fn is_zombie(&self) -> bool {
+            // The state follows the parenthesised command name in /proc/<pid>/stat.
+            std::fs::read_to_string(format!("/proc/{}/stat", self.0))
+                .ok()
+                .and_then(|stat| {
+                    let state = stat.rsplit_once(')')?.1.trim_start().chars().next()?;
+                    Some(state == 'Z')
+                })
+                .unwrap_or(false)
+        }
+    }
+
+    impl Drop for Grandchild {
+        fn drop(&mut self) {
+            if self.running() {
+                // SAFETY: as above; the pid is still the test's sleep, which is alive.
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
     }
 }

@@ -55,7 +55,7 @@ Referrer artifact type (attached via the OCI `subject` field, never primary cont
 Host-agnostic JSON describing params schema, version discovery, and lifecycle phases (`install`, `start`, `drain`, `stop`, `finish`, `uninstall`).
 
 - **Params:** closed JSON Schema subset (`string`/`boolean`/`integer`/`number` only); custom `sensitive` and `placeholder` fields.
-- **Commands:** string (shell) or argv array with `${VAR}` substitution.
+- **Commands:** string or argv array with `${VAR}` substitution. A string runs under the user's login shell (PowerShell on Windows); an argv array such as `["sh", "run.sh"]` runs with no shell in between, the better form for a long-running command. On Unix each command leads its own process group, and stop signals and kills go to the whole group.
 - **Service mode:** `start.service` names a platform service created by install scripts; runtime only starts/stops/queries it.
 - **Reserved env:** `APP_VERSION`, `APP_PID`, `APP_EXIT_CODE`, etc.
 - **Human metadata:** OCI manifest annotations (`org.opencontainers.image.description`, etc.) from the build recipe `annotations` field (never uploaded as content).

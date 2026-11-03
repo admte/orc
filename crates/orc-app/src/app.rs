@@ -330,10 +330,18 @@ pub struct CommandPhase {
     pub timeout: Option<String>,
 }
 
+/// A lifecycle command as a recipe gives it.
+///
+/// On Unix every command leads its own process group, and a stop signal, a
+/// grace-expiry kill or a phase timeout goes to the whole group, so it reaches the app
+/// whatever sits between it and the runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum CommandValue {
+    /// Runs under the user's login shell (PowerShell on Windows).
     String(String),
+    /// Runs its program directly, with `${VAR}` substitution and no shell in between —
+    /// the better form for a long-running command, e.g. `["sh", "run.sh"]`.
     Argv(Vec<String>),
 }
 
