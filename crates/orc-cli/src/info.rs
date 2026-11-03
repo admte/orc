@@ -282,4 +282,42 @@ mod tests {
             ]
         );
     }
+
+    /// A v2 app reads as its format, with each phase's argv as resolved for the platform
+    /// whose config it is — tokens and all, since secrets only ever appear as paths.
+    #[test]
+    fn a_v2_app_shows_its_format_and_resolved_commands() {
+        let config = AppConfig::parse(
+            AppFormat::V2,
+            br#"{
+                "install": {"command": ["./install.sh", "--arch=amd64"], "timeout": "600s"},
+                "start": {"service": "runner", "command": ["./run.sh", "--token-file=${token_file}"]},
+                "uninstall": {"command": []}
+            }"#,
+        )
+        .expect("config");
+        let info = build_info_document(
+            "ghcr.io/acme/runner:2".to_owned(),
+            "sha256:abc".to_owned(),
+            String::new(),
+            vec!["linux/amd64".to_owned()],
+            Some(&config),
+        );
+        assert_eq!(info.format, "v2");
+        assert_eq!(
+            info.mode,
+            format!(
+                "service {} (runtime-managed)",
+                crate::service::platform_name("runner")
+            )
+        );
+        assert_eq!(
+            info.phases,
+            vec![
+                r#"install (600s) ["./install.sh","--arch=amd64"]"#,
+                r#"start ["./run.sh","--token-file=${token_file}"]"#,
+                "uninstall [skipped]",
+            ]
+        );
+    }
 }

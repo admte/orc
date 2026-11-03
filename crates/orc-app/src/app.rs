@@ -941,6 +941,89 @@ mod tests {
     }
 
     #[test]
+    fn the_format_is_read_off_the_media_types() {
+        assert_eq!(
+            AppFormat::of_manifest(APP_ARTIFACT_TYPE, APP_CONFIG_MEDIA_TYPE).expect("v1"),
+            AppFormat::V1
+        );
+        assert_eq!(
+            AppFormat::of_manifest(APP_V2_ARTIFACT_TYPE, APP_V2_CONFIG_MEDIA_TYPE).expect("v2"),
+            AppFormat::V2
+        );
+        // Mismatched halves, and other artifacts, are not apps.
+        assert!(matches!(
+            AppFormat::of_manifest(APP_V2_ARTIFACT_TYPE, APP_CONFIG_MEDIA_TYPE),
+            Err(crate::error::CliError::NotFound(_))
+        ));
+        assert_eq!(
+            AppFormat::from_artifact_type(OS_RECIPE_ARTIFACT_TYPE).expect("not an app"),
+            None
+        );
+        assert_eq!(AppFormat::V2.config_file(), "app.config.v2.json");
+    }
+
+    /// A runtime refuses an app of a format it does not run, naming the format.
+    #[test]
+    fn an_unknown_app_format_is_refused_by_name() {
+        let err = AppFormat::of_manifest(
+            "application/vnd.orc8r.app.v3",
+            "application/vnd.orc8r.app.config.v3+json",
+        )
+        .expect_err("v3");
+        let message = err.to_string();
+        assert!(matches!(err, crate::error::CliError::Usage(_)), "{message}");
+        assert!(message.contains("app format v3"), "{message}");
+        assert!(
+            message.contains("application/vnd.orc8r.app.v3"),
+            "{message}"
+        );
+        let doc = ManifestDocument::parse(
+            br#"{"schemaVersion":2,"artifactType":"application/vnd.orc8r.app.v3","manifests":[]}"#,
+            OCI_IMAGE_INDEX,
+        )
+        .expect("index");
+        assert!(!doc.is_orc_app());
+        assert!(doc.app_format().is_err());
+    }
+
+    #[test]
+    fn a_v2_manifest_and_index_are_orc_apps() {
+        let manifest = ManifestDocument::parse(
+            br#"{"schemaVersion":2,"artifactType":"application/vnd.orc8r.app.v2","config":{"mediaType":"application/vnd.orc8r.app.config.v2+json","digest":"sha256:d","size":1}}"#,
+            OCI_IMAGE_MANIFEST,
+        )
+        .expect("manifest");
+        assert_eq!(manifest.app_format().expect("format"), Some(AppFormat::V2));
+        let index = ManifestDocument::parse(
+            br#"{"schemaVersion":2,"artifactType":"application/vnd.orc8r.app.v2","manifests":[]}"#,
+            OCI_IMAGE_INDEX,
+        )
+        .expect("index");
+        assert!(index.is_orc_app());
+    }
+
+    #[test]
+    fn a_work_dir_says_which_format_its_app_is() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_V2),
+            br#"{"install":{"command":["./x"]}}"#,
+        )
+        .expect("v2 config");
+        let config = read_config(dir.path()).expect("read");
+        assert_eq!(config.format, AppFormat::V2);
+        // Both at once cannot be told apart, so neither is run.
+        std::fs::write(dir.path().join(CONFIG_FILE), b"{}").expect("v1 config");
+        let err = read_config(dir.path()).expect_err("ambiguous");
+        assert!(err.to_string().contains("both"), "{err}");
+        remove_other_configs(dir.path(), AppFormat::V2);
+        assert_eq!(read_config(dir.path()).expect("read").format, AppFormat::V2);
+        // A config decoded without its media type is v1, as every existing caller expects.
+        let plain: AppConfig = serde_json::from_str("{}").expect("config");
+        assert_eq!(plain.format, AppFormat::V1);
+    }
+
+    #[test]
     fn referrers_tag_replaces_colon_and_truncates() {
         let hex = "a".repeat(64);
         assert_eq!(

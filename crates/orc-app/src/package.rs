@@ -1872,4 +1872,78 @@ mod tests {
             assert!(err.to_string().contains(expected), "{case}: {err}");
         }
     }
+    // ── format v2 (spec 214) ─────────────────────────────────────────────────────
+
+    fn v2_dir(config: &str, executable: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("app.config.v2.json"), config).expect("config");
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = if executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_v2_directory_push_is_typed_v2_and_checked() {
+        let dir = v2_dir(
+            r#"{"start":{"command":["./run.sh","--a=${a}"]},"params":{"type":"object","properties":{"a":{"type":"string"}}}}"#,
+            true,
+        );
+        let plan = plan_directory_push(dir.path()).expect("plan");
+        assert_eq!(plan.artifact_type, crate::app::APP_V2_ARTIFACT_TYPE);
+        assert_eq!(plan.config_media_type, crate::app::APP_V2_CONFIG_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn a_v2_directory_push_refuses_what_the_checks_refuse() {
+        let cases = [
+            (
+                r#"{"start":{"command":["./run.sh","--a=${nope}"]}}"#,
+                true,
+                "${nope} names no build var",
+            ),
+            (r#"{"start":{"command":"./run.sh"}}"#, true, "is a string"),
+            (
+                r#"{"start":{"command":{"unix":["./run.sh"]}}}"#,
+                true,
+                "is a per-OS value",
+            ),
+            (
+                r#"{"start":{"command":["./run.sh","${os}"]}}"#,
+                true,
+                "${os} is a build-time token",
+            ),
+            (
+                r#"{"start":{"command":["./run.sh"]}}"#,
+                false,
+                "without its executable bit",
+            ),
+        ];
+        for (config, executable, expected) in cases {
+            #[cfg(not(unix))]
+            if !executable {
+                continue;
+            }
+            let dir = v2_dir(config, executable);
+            let err = plan_directory_push(dir.path()).expect_err(config);
+            assert!(err.to_string().contains(expected), "{config}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_directory_push_of_an_unknown_app_format_is_refused_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("app.config.v3.json"), "{}").expect("config");
+        let err = plan_directory_push(dir.path()).expect_err("v3");
+        assert!(err.to_string().contains("app format v3"), "{err}");
+    }
 }
