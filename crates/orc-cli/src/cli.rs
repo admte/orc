@@ -750,11 +750,18 @@ async fn info(args: AppReadArgs, settings: &CliSettings, config: &StoredConfig) 
             resolved.full
         )));
     };
-    // The phases read as this host's platform's, where the package has one: a v2 app's
-    // commands are resolved per platform at build.
-    let platform_config =
+    // A v2 app's commands are resolved per platform at build, so its phases read as this
+    // host's platform's, where the package has one, and say so. A v1 app reads as before.
+    let is_v2 = summary
+        .config
+        .as_ref()
+        .is_some_and(|config| config.format == crate::app::AppFormat::V2);
+    let platform_config = if is_v2 {
         crate::versions::read_platform_config(&registry, &resolved.repository, &resolved.tag)
-            .await?;
+            .await?
+    } else {
+        None
+    };
     let (config, config_platform) = match platform_config {
         Some((config, platform)) => (Some(config), Some(platform)),
         None => (summary.config, None),
@@ -766,9 +773,7 @@ async fn info(args: AppReadArgs, settings: &CliSettings, config: &StoredConfig) 
         unique_platforms(summary.platforms),
         config.as_ref(),
     );
-    if info.format == "v2" {
-        info.config_platform = config_platform;
-    }
+    info.config_platform = config_platform;
     print_info(&info, args.output)
 }
 
