@@ -521,6 +521,10 @@ async fn print_app_help_for(command: &str, app: &str) -> Result<()> {
 struct ImageIndexDocument<'a> {
     schema_version: u8,
     media_type: &'a str,
+    /// Set for a format v2 app only, so its index states its format the way `orc build`'s
+    /// does; a v1 push writes the index it always has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_type: Option<&'a str>,
     manifests: Vec<IndexDescriptor>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     annotations: std::collections::BTreeMap<String, String>,
@@ -1388,6 +1392,8 @@ async fn publish_platform_index(
     let index = ImageIndexDocument {
         schema_version: 2,
         media_type: OCI_IMAGE_INDEX,
+        artifact_type: (plan.artifact_type == crate::app::APP_V2_ARTIFACT_TYPE)
+            .then_some(crate::app::APP_V2_ARTIFACT_TYPE),
         manifests,
         annotations: plan.annotations.clone(),
     };
