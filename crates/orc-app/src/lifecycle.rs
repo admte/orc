@@ -12,7 +12,7 @@ use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{AppConfig, CommandPhase, CommandValue, ParamLifetime};
+use crate::app::{AppConfig, AppFormat, CommandPhase, CommandValue, ParamLifetime};
 use crate::error::{CliError, Result};
 use crate::params::{ParsedParam, ParsedParamValue};
 use crate::process::{
@@ -20,6 +20,7 @@ use crate::process::{
 };
 use crate::reboot::{PhaseOutcome, PhaseReboot};
 use crate::service::{self, RestartPolicy, ServiceSpec};
+use crate::v2::{self, Context as V2Context, Phase as V2Phase};
 
 /// Per-instance directory under the app work dir for start-phase file-backed params.
 const PARAM_DIR: &str = ".orc-params";
@@ -170,25 +171,39 @@ pub async fn run_install_phase(
     persist_state: Option<PersistState>,
     interrupt: Option<&PhaseInterrupt>,
 ) -> Result<PhaseOutcome> {
-    let Some(command) = lifecycle_command("install", app, config.install.as_ref(), work_dir)?
+    let Some(command) = phase_command(
+        config.format,
+        "install",
+        app,
+        config.install.as_ref(),
+        work_dir,
+    )?
     else {
         // An app with no install phase still retires the marker its runtime opened.
         return phase_outcome(reboot, &Ok(()));
     };
     // Blocking phase: temp files live only for the phase duration.
-    let env = phase_env(
+    let env = config_phase_env(
+        V2Phase::Install,
+        config,
         version,
         instance,
         params,
         secrets,
         None,
         reboot,
-        declared_service(config),
         persist_state,
     )
     .await?;
     let result = run_command(
-        "install", command, work_dir, &env.vars, log_line, reboot, interrupt,
+        "install",
+        command,
+        config.format,
+        work_dir,
+        &env,
+        log_line,
+        reboot,
+        interrupt,
     )
     .await;
     for path in env.startup_files.into_iter().chain(env.param_files) {
@@ -231,24 +246,36 @@ pub async fn run_capture_hook_phase(
     secrets: Option<&dyn SecretResolver>,
     log_line: LogLine,
 ) -> Result<()> {
-    let Some(mut command) = hook.map(command_phase).transpose()?.flatten() else {
+    let declared = match config.format {
+        AppFormat::V1 => hook.map(command_phase).transpose()?.flatten(),
+        AppFormat::V2 => hook.map(command_phase_v2).transpose()?.flatten(),
+    };
+    let Some(mut command) = declared else {
         return Ok(());
     };
     command.timeout = Some(capture_hook_timeout(command.timeout));
+    let hook_phase = if phase == "hook_post" {
+        V2Phase::HookPost
+    } else {
+        V2Phase::HookPre
+    };
     // Blocking phase: temp files live only for the hook's duration. A hook never requests
     // a reboot — a capture is not an install — so no reboot plumbing is offered to it.
-    let env = phase_env(
-        version,
-        instance,
-        params,
-        secrets,
-        None,
-        None,
-        declared_service(config),
-        None,
+    let env = config_phase_env(
+        hook_phase, config, version, instance, params, secrets, None, None, None,
     )
     .await?;
-    let result = run_command(phase, command, work_dir, &env.vars, log_line, None, None).await;
+    let result = run_command(
+        phase,
+        command,
+        config.format,
+        work_dir,
+        &env,
+        log_line,
+        None,
+        None,
+    )
+    .await;
     for path in env.startup_files.into_iter().chain(env.param_files) {
         let _ = std::fs::remove_file(path);
     }
@@ -270,14 +297,30 @@ pub async fn run_uninstall_phase(
     reboot: Option<&PhaseReboot>,
     interrupt: Option<&PhaseInterrupt>,
 ) -> Result<PhaseOutcome> {
-    let Some(command) = lifecycle_command("uninstall", app, config.uninstall.as_ref(), work_dir)?
+    let Some(command) = phase_command(
+        config.format,
+        "uninstall",
+        app,
+        config.uninstall.as_ref(),
+        work_dir,
+    )?
     else {
         return phase_outcome(reboot, &Ok(()));
     };
-    let env = durable_phase_env(version, instance, params, reboot, declared_service(config))?;
+    let env = match config.format {
+        AppFormat::V1 => PhaseEnv::vars(durable_phase_env(
+            version,
+            instance,
+            params,
+            reboot,
+            declared_service(config),
+        )?),
+        AppFormat::V2 => durable_phase_env_v2(config, version, instance, params, reboot)?,
+    };
     let result = run_command(
         "uninstall",
         command,
+        config.format,
         work_dir,
         &env,
         log_line,
@@ -285,6 +328,10 @@ pub async fn run_uninstall_phase(
         interrupt,
     )
     .await;
+    // The files a v2 uninstall wrote for its file-backed params live for the phase only.
+    for path in env.startup_files.iter().chain(&env.param_files) {
+        let _ = std::fs::remove_file(path);
+    }
     let outcome = phase_outcome(reboot, &result)?;
     result?;
     Ok(outcome)
@@ -308,14 +355,15 @@ pub async fn run_start_phase(
 ) -> Result<PhaseOutcome> {
     let command = required_start_command(app, config, work_dir)?;
     // Blocking phase: temp files live only for the phase duration.
-    let env = phase_env(
+    let env = config_phase_env(
+        V2Phase::Start,
+        config,
         version,
         instance,
         params,
         secrets,
         None,
         reboot,
-        declared_service(config),
         persist_state,
     )
     .await?;
@@ -325,8 +373,9 @@ pub async fn run_start_phase(
             value: command,
             timeout: None,
         },
+        config.format,
         work_dir,
-        &env.vars,
+        &env,
         log_line,
         reboot,
         None,
@@ -354,7 +403,15 @@ pub struct StartCommand {
     /// lifecycle commands ran in. Startup-lifetime param files are withdrawn right
     /// after the child starts, so a probe command must not depend on their `*_FILE`
     /// entries — the variable still names a path that no longer exists.
+    ///
+    /// A format v2 app's environment carries no params: this is the login environment's
+    /// additions only, and its probes read [`StartCommand::tokens`] instead.
     pub env: BTreeMap<String, String>,
+    /// The run-time token values the start command was resolved with — params, `_file`
+    /// paths and context — for a format v2 app's probe commands, which take the tokens
+    /// of `start` (spec 214). Empty for a v1 app. The same caveat holds: a startup-lifetime
+    /// file is withdrawn once the app has started, so its `_file` path names nothing then.
+    pub tokens: BTreeMap<String, String>,
 }
 
 /// Builds the (unspawned) start-phase command with the param environment and
@@ -377,28 +434,25 @@ pub async fn start_command(
 ) -> Result<StartCommand> {
     let command = required_start_command(app, config, work_dir)?;
     let param_dir = prepare_param_dir(work_dir)?;
-    let env = phase_env(
+    let env = config_phase_env(
+        V2Phase::Start,
+        config,
         version,
         instance,
         params,
         secrets,
         Some(&param_dir),
         reboot,
-        declared_service(config),
         persist_state,
     )
     .await?;
-    let mut process = match &command {
-        CommandValue::String(command) => shell_command(&shim_first(command, reboot)),
-        CommandValue::Argv(argv) => argv_command(argv, &env.vars)?,
-    };
-    apply_login_env(&mut process);
-    process.current_dir(work_dir).envs(&env.vars);
+    let process = phase_process(&command, config.format, work_dir, &env, reboot)?;
     Ok(StartCommand {
         command: process,
         param_files: env.param_files,
         startup_files: env.startup_files,
         env: env.vars,
+        tokens: env.tokens,
     })
 }
 
@@ -419,6 +473,27 @@ pub fn probe_command(
     Ok(process)
 }
 
+/// [`probe_command`] for a format v2 app: the argv resolved against the tokens of
+/// `start` ([`StartCommand::tokens`]), in the app's work directory, with the login
+/// environment and nothing derived from params.
+pub fn probe_command_v2(
+    argv: &[String],
+    work_dir: &Path,
+    tokens: &BTreeMap<String, String>,
+) -> Result<Command> {
+    let env = PhaseEnv {
+        tokens: tokens.clone(),
+        ..PhaseEnv::default()
+    };
+    phase_process(
+        &CommandValue::Argv(argv.to_vec()),
+        AppFormat::V2,
+        work_dir,
+        &env,
+        None,
+    )
+}
+
 /// Command the start phase resolves to, or `None` when the app defines no start
 /// at all — an install-only app whose install *is* the whole job.
 ///
@@ -427,12 +502,22 @@ pub fn probe_command(
 /// and rely on the file-naming convention alone. The config wins because it is the
 /// specific statement — a package can carry a script for every phase and still have one
 /// phase overridden, and an author who wrote a command means it.
+///
+/// A format v2 app has no script fallback: its start is the command it declares, and an
+/// empty list is no command at all (spec 214 *Commands*).
 #[must_use]
 pub fn resolve_start_command(
     app: &str,
     config: &AppConfig,
     work_dir: &Path,
 ) -> Option<CommandValue> {
+    if config.format == AppFormat::V2 {
+        return config
+            .start
+            .as_ref()
+            .and_then(|start| start.command.clone())
+            .filter(|command| !is_empty_argv(command));
+    }
     if let Some(command) = config
         .start
         .as_ref()
@@ -493,6 +578,9 @@ impl StartMode {
 /// A packaged `start-{app}` script counts as the command, exactly as it does for every
 /// other phase: a package that ships one alongside `service` is asking the runtime to
 /// own the definition and run the script inside it.
+///
+/// For a format v2 app `env` holds the run-time token values the name is written in
+/// (`version`, `instance`, params), and no script stands in for a command.
 pub fn resolve_start_mode(
     app: &str,
     config: &AppConfig,
@@ -503,7 +591,11 @@ pub fn resolve_start_mode(
     let Some(raw) = declared_service(config) else {
         return Ok(command.map(StartMode::Subprocess));
     };
-    let expanded = substitute_vars(raw, env)?;
+    let expanded = match config.format {
+        AppFormat::V1 => substitute_vars(raw, env)?,
+        // A v2 service name is written in run-time tokens: `env` holds their values.
+        AppFormat::V2 => expand_service_v2(raw, env)?,
+    };
     service::validate_identifier(&expanded)?;
     let name = service::platform_name(&expanded);
     Ok(Some(match command {
@@ -773,7 +865,18 @@ pub fn instance_service_name(
     let Some(raw) = declared_service(config) else {
         return Ok(None);
     };
-    let expanded = substitute_vars(raw, &name_vars(version, instance, params))?;
+    let expanded = match config.format {
+        AppFormat::V1 => substitute_vars(raw, &name_vars(version, instance, params))?,
+        AppFormat::V2 => expand_service_v2(
+            raw,
+            &service_tokens_v2(
+                config,
+                version,
+                instance,
+                &plain_param_values(config, params)?,
+            ),
+        )?,
+    };
     service::validate_identifier(&expanded)?;
     Ok(Some(service::platform_name(&expanded)))
 }
@@ -963,7 +1066,7 @@ struct PhaseCommand {
     timeout: Option<Duration>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct PhaseEnv {
     vars: BTreeMap<String, String>,
     /// File-backed params the app may read for its whole run.
@@ -971,6 +1074,17 @@ struct PhaseEnv {
     /// File-backed params consumed during startup only (operator secrets by
     /// default); the host withdraws them once the start phase completes.
     startup_files: Vec<PathBuf>,
+    /// A format v2 phase's run-time token values; empty for v1, whose params are `vars`.
+    tokens: BTreeMap<String, String>,
+}
+
+impl PhaseEnv {
+    fn vars(vars: BTreeMap<String, String>) -> Self {
+        Self {
+            vars,
+            ..Self::default()
+        }
+    }
 }
 
 /// How long a capture hook may run when its manifest declares no `timeout`. Long
@@ -1025,6 +1139,34 @@ fn command_phase(phase: &CommandPhase) -> Result<Option<PhaseCommand>> {
             })
         })
         .transpose()
+}
+
+/// A phase's command in the app's own format: v1 with its packaged-script fallback, v2
+/// with none (spec 214: "the runtime MUST NOT discover scripts").
+fn phase_command(
+    format: AppFormat,
+    phase: &str,
+    app: &str,
+    config: Option<&CommandPhase>,
+    work_dir: &Path,
+) -> Result<Option<PhaseCommand>> {
+    match format {
+        AppFormat::V1 => lifecycle_command(phase, app, config, work_dir),
+        AppFormat::V2 => config
+            .map(command_phase_v2)
+            .transpose()
+            .map(Option::flatten),
+    }
+}
+
+/// A v2 phase's declared command; an empty list skips the phase.
+fn command_phase_v2(phase: &CommandPhase) -> Result<Option<PhaseCommand>> {
+    Ok(command_phase(phase)?.filter(|command| !is_empty_argv(&command.value)))
+}
+
+/// `[]`: a v2 phase skipped on purpose.
+fn is_empty_argv(command: &CommandValue) -> bool {
+    matches!(command, CommandValue::Argv(argv) if argv.is_empty())
 }
 
 #[cfg(unix)]
@@ -1155,7 +1297,339 @@ async fn phase_env(
         vars,
         param_files,
         startup_files,
+        tokens: BTreeMap::new(),
     })
+}
+
+/// The phase environment for `config`'s format: v1's params-as-variables
+/// ([`phase_env`]), or v2's params-as-tokens ([`phase_env_v2`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the phase environment is assembled from independent sources"
+)]
+async fn config_phase_env(
+    phase: V2Phase,
+    config: &AppConfig,
+    version: &str,
+    instance: &str,
+    params: &BTreeMap<String, ParsedParam>,
+    secrets: Option<&dyn SecretResolver>,
+    param_dir: Option<&Path>,
+    reboot: Option<&PhaseReboot>,
+    persist_state: Option<PersistState>,
+) -> Result<PhaseEnv> {
+    match config.format {
+        AppFormat::V1 => {
+            phase_env(
+                version,
+                instance,
+                params,
+                secrets,
+                param_dir,
+                reboot,
+                declared_service(config),
+                persist_state,
+            )
+            .await
+        }
+        AppFormat::V2 => {
+            phase_env_v2(
+                phase,
+                config,
+                version,
+                instance,
+                params,
+                secrets,
+                param_dir,
+                reboot,
+                persist_state,
+            )
+            .await
+        }
+    }
+}
+
+/// A format v2 phase's environment and token values (spec 214 *Tokens*, *Environment*).
+///
+/// The environment is what the runtime itself has plus the reboot shim's `PATH` entry and
+/// `ORC_REBOOT_*` — no param and no `APP_*` variable, so nothing the app starts inherits
+/// its configuration. Each param becomes a token instead: a plain param its value,
+/// `${name}`; a file-backed one the path of a `0600` file holding it, `${name_file}`,
+/// filed by lifetime exactly as v1 files it. The context tokens are the ones `phase`
+/// reads; a phase-specific one (a pid, a stop reason) is added by its caller.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the phase environment is assembled from independent sources"
+)]
+async fn phase_env_v2(
+    phase: V2Phase,
+    config: &AppConfig,
+    version: &str,
+    instance: &str,
+    params: &BTreeMap<String, ParsedParam>,
+    secrets: Option<&dyn SecretResolver>,
+    param_dir: Option<&Path>,
+    reboot: Option<&PhaseReboot>,
+    persist_state: Option<PersistState>,
+) -> Result<PhaseEnv> {
+    let mut env = PhaseEnv::default();
+    apply_reboot_env(&mut env.vars, reboot);
+    for param in params.values() {
+        if !delivered_as_file(param) {
+            continue;
+        }
+        let bytes = match &param.value {
+            ParsedParamValue::SecretRef(reference) => {
+                let Some(secrets) = secrets else {
+                    return Err(CliError::Operational(format!(
+                        "secret URI resolution for --{} is not implemented yet",
+                        param.name.replace('_', "-")
+                    )));
+                };
+                secrets.resolve(reference).await.map_err(|err| {
+                    CliError::Operational(format!("resolve secret {reference}: {err}"))
+                })?
+            }
+            other => durable_param_bytes(other).to_vec(),
+        };
+        let path = write_param_file(param_dir, &param.name, &bytes)?;
+        env.tokens
+            .insert(format!("{}_file", param.name), path.display().to_string());
+        match param.lifetime {
+            ParamLifetime::Startup => env.startup_files.push(path),
+            ParamLifetime::Runtime => env.param_files.push(path),
+        }
+    }
+    let plain = plain_param_values(config, params)?;
+    insert_context_v2(
+        &mut env.tokens,
+        phase,
+        config,
+        version,
+        instance,
+        &plain,
+        persist_state,
+    )?;
+    env.tokens.extend(plain);
+    Ok(env)
+}
+
+/// Whether a param reaches a v2 phase as a file: declared file-backed, or holding a
+/// secret reference, which is never handed over as a value.
+fn delivered_as_file(param: &ParsedParam) -> bool {
+    param.file_backed || matches!(param.value, ParsedParamValue::SecretRef(_))
+}
+
+/// The value tokens of the params that are not file-backed. A host-sourced param that
+/// resolved to nothing (an empty value) is unset, as spec 214 counts it, so an element
+/// naming it is dropped.
+fn plain_param_values(
+    config: &AppConfig,
+    params: &BTreeMap<String, ParsedParam>,
+) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    for param in params.values().filter(|param| !delivered_as_file(param)) {
+        let value = match &param.value {
+            ParsedParamValue::String(value) | ParsedParamValue::Number(value) => value.clone(),
+            ParsedParamValue::Boolean(value) => value.to_string(),
+            ParsedParamValue::File { bytes, .. } => {
+                String::from_utf8(bytes.clone()).map_err(|_| {
+                    CliError::Usage(format!(
+                        "app param --{} is read from a file that is not UTF-8 text, and it is \
+                     passed as an argument",
+                        param.name.replace('_', "-")
+                    ))
+                })?
+            }
+            ParsedParamValue::SecretRef(_) => continue,
+        };
+        if value.is_empty() && is_sourced(config, &param.name) {
+            continue;
+        }
+        values.insert(param.name.clone(), value);
+    }
+    Ok(values)
+}
+
+/// Whether the config fills `name` from an `x-source`.
+fn is_sourced(config: &AppConfig, name: &str) -> bool {
+    config
+        .params
+        .as_ref()
+        .and_then(|params| params.properties.get(name))
+        .is_some_and(|property| property.x_source.is_some())
+}
+
+/// Adds the context tokens `phase` reads, from what every phase knows.
+fn insert_context_v2(
+    tokens: &mut BTreeMap<String, String>,
+    phase: V2Phase,
+    config: &AppConfig,
+    version: &str,
+    instance: &str,
+    plain: &BTreeMap<String, String>,
+    persist_state: Option<PersistState>,
+) -> Result<()> {
+    if version != "default" {
+        insert_context_token(
+            tokens,
+            phase,
+            config,
+            V2Context::Version,
+            version.to_owned(),
+        );
+    }
+    if !instance.is_empty() {
+        insert_context_token(
+            tokens,
+            phase,
+            config,
+            V2Context::Instance,
+            instance.to_owned(),
+        );
+    }
+    if let Some(raw) = declared_service(config)
+        && phase.context_available(V2Context::Service, true, config.persist.is_some())
+    {
+        let expanded =
+            expand_service_v2(raw, &service_tokens_v2(config, version, instance, plain))?;
+        service::validate_identifier(&expanded)?;
+        tokens.insert(
+            V2Context::Service.name().to_owned(),
+            service::platform_name(&expanded),
+        );
+    }
+    if let Some(state) = persist_state {
+        insert_context_token(
+            tokens,
+            phase,
+            config,
+            V2Context::PersistState,
+            state.as_str().to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Sets one context token when `phase` reads it; a phase never sees context the spec
+/// does not give it, so a token the checker would refuse resolves as unset here too.
+fn insert_context_token(
+    tokens: &mut BTreeMap<String, String>,
+    phase: V2Phase,
+    config: &AppConfig,
+    context: V2Context,
+    value: String,
+) {
+    if phase.context_available(
+        context,
+        declared_service(config).is_some(),
+        config.persist.is_some(),
+    ) {
+        tokens.insert(context.name().to_owned(), value);
+    }
+}
+
+/// The tokens a v2 `start.service` is written in: plain params, `${version}` and
+/// `${instance}`.
+fn service_tokens_v2(
+    config: &AppConfig,
+    version: &str,
+    instance: &str,
+    plain: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut tokens = plain.clone();
+    insert_context_v2_name(&mut tokens, config, version, instance);
+    tokens
+}
+
+fn insert_context_v2_name(
+    tokens: &mut BTreeMap<String, String>,
+    config: &AppConfig,
+    version: &str,
+    instance: &str,
+) {
+    if version != "default" {
+        insert_context_token(
+            tokens,
+            V2Phase::Service,
+            config,
+            V2Context::Version,
+            version.to_owned(),
+        );
+    }
+    if !instance.is_empty() {
+        insert_context_token(
+            tokens,
+            V2Phase::Service,
+            config,
+            V2Context::Instance,
+            instance.to_owned(),
+        );
+    }
+}
+
+/// Expands a v2 service identifier. A name cannot be dropped the way an argv element is,
+/// so a token naming an unset value with no default is an error.
+fn expand_service_v2(raw: &str, tokens: &BTreeMap<String, String>) -> Result<String> {
+    v2::token::substitute(raw, |name| tokens.get(name).map(String::as_str))
+        .map_err(|err| CliError::Operational(format!("start.service {raw:?}: {err}")))?
+        .ok_or_else(|| {
+            CliError::Operational(format!(
+                "start.service {raw:?} names a value that is not set"
+            ))
+        })
+}
+
+/// A format v2 uninstall's environment, from the params the version was installed with.
+///
+/// The map is what a host has kept: values as strings, and for a param whose value it
+/// had to resolve first, the path of the file it wrote, under `<name>_file`. Such a path
+/// is handed over as the `${name_file}` token as it is — the host wrote it and removes
+/// it. A file-backed param kept as a value is written to a `0600` file that lives for
+/// the phase; every other value is its own token.
+fn durable_phase_env_v2(
+    config: &AppConfig,
+    version: &str,
+    instance: &str,
+    params: &BTreeMap<String, String>,
+    reboot: Option<&PhaseReboot>,
+) -> Result<PhaseEnv> {
+    let declared = config.params.as_ref().map(|params| &params.properties);
+    let property = |name: &str| declared.and_then(|properties| properties.get(name));
+    let mut env = PhaseEnv::default();
+    apply_reboot_env(&mut env.vars, reboot);
+    let mut plain = BTreeMap::new();
+    for (name, value) in params {
+        if property(name).is_none()
+            && let Some(base) = name.strip_suffix("_file")
+            && property(base).is_some()
+        {
+            env.tokens.insert(name.clone(), value.clone());
+            continue;
+        }
+        if property(name).is_some_and(crate::params::is_file_backed_property) {
+            let path = write_param_file(None, name, value.as_bytes())?;
+            env.tokens
+                .insert(format!("{name}_file"), path.display().to_string());
+            env.param_files.push(path);
+            continue;
+        }
+        if value.is_empty() && is_sourced(config, name) {
+            continue;
+        }
+        plain.insert(name.clone(), value.clone());
+    }
+    insert_context_v2(
+        &mut env.tokens,
+        V2Phase::Uninstall,
+        config,
+        version,
+        instance,
+        &plain,
+        None,
+    )?;
+    env.tokens.extend(plain);
+    Ok(env)
 }
 
 /// Puts the reboot shim in front of the phase's `PATH` and — while the phase is under
@@ -1484,26 +1958,64 @@ async fn wait_phase(
     }
 }
 
+/// Builds a phase command, unspawned, in the app's format, with the phase environment
+/// and the work directory applied.
+///
+/// v1: a string runs under the login shell, an argv list directly with `${VAR}`
+/// substitution from the environment. v2: an argv list only, its tokens substituted from
+/// the phase's token values and its program resolved against the app directory
+/// ([`v2::command`]). Either way the command leads its own process group on Unix.
+fn phase_process(
+    command: &CommandValue,
+    format: AppFormat,
+    work_dir: &Path,
+    env: &PhaseEnv,
+    reboot: Option<&PhaseReboot>,
+) -> Result<Command> {
+    let mut process = match (format, command) {
+        (AppFormat::V1, CommandValue::String(command)) => {
+            shell_command(&shim_first(command, reboot))
+        }
+        (AppFormat::V1, CommandValue::Argv(argv)) => argv_command(argv, &env.vars)?,
+        (AppFormat::V2, CommandValue::String(_)) => {
+            return Err(CliError::Operational(
+                "an app format v2 command is an argv list; this one is a string, which v2 \
+                 does not run"
+                    .to_owned(),
+            ));
+        }
+        (AppFormat::V2, CommandValue::Argv(template)) => {
+            let argv = v2::command::command_argv(
+                template,
+                &env.tokens,
+                work_dir,
+                v2::command::CommandHost::current(),
+            )?;
+            let mut process = Command::new(&argv[0]);
+            process.args(&argv[1..]);
+            #[cfg(unix)]
+            process.process_group(0);
+            process
+        }
+    };
+    apply_login_env(&mut process);
+    process.current_dir(work_dir).envs(&env.vars);
+    Ok(process)
+}
+
 /// Spawns a phase command with the phase environment applied and both pipes draining
 /// to the log.
 fn spawn_phase(
     phase: &str,
     command: &CommandValue,
+    format: AppFormat,
     work_dir: &Path,
-    env: &BTreeMap<String, String>,
+    env: &PhaseEnv,
     log_line: LogLine,
     reboot: Option<&PhaseReboot>,
 ) -> Result<PhaseProcess> {
-    let mut process = match command {
-        CommandValue::String(command) => shell_command(&shim_first(command, reboot)),
-        CommandValue::Argv(argv) => argv_command(argv, env)?,
-    };
-    apply_login_env(&mut process);
-    process
-        .current_dir(work_dir)
-        .envs(env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut process = phase_process(command, format, work_dir, env, reboot)?;
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = process
         .spawn()
         .map_err(|err| CliError::Operational(format!("run {phase} phase: {err}")))?;
@@ -1536,11 +2048,16 @@ fn spawn_phase(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "phase identity, command, and runtime wiring are each required"
+)]
 async fn run_command(
     phase: &str,
     command: PhaseCommand,
+    format: AppFormat,
     work_dir: &Path,
-    env: &BTreeMap<String, String>,
+    env: &PhaseEnv,
     log_line: LogLine,
     reboot: Option<&PhaseReboot>,
     interrupt: Option<&PhaseInterrupt>,
@@ -1549,7 +2066,15 @@ async fn run_command(
     if let Some(interrupt) = interrupt {
         interrupt.check(phase)?;
     }
-    let mut process = spawn_phase(phase, &command.value, work_dir, env, log_line, reboot)?;
+    let mut process = spawn_phase(
+        phase,
+        &command.value,
+        format,
+        work_dir,
+        env,
+        log_line,
+        reboot,
+    )?;
     let status = match wait_phase(&mut process, command.timeout, interrupt).await {
         PhaseEnd::Exited(status) => status,
         PhaseEnd::TimedOut => {
@@ -1998,8 +2523,16 @@ pub fn stop_budget(app: &str, config: &AppConfig, work_dir: &Path) -> Duration {
     // both hold the stop up for `stop.timeout`, so both are charged. Resolving it the
     // same way the sequence does is what keeps the budget an honest upper bound — a
     // script-only stop that reported no timeout would understate the required budget.
-    let has_command = stop.is_some_and(|stop| stop.command.is_some())
-        || lifecycle_script("stop", app, work_dir).is_some();
+    let has_command = match config.format {
+        AppFormat::V1 => {
+            stop.is_some_and(|stop| stop.command.is_some())
+                || lifecycle_script("stop", app, work_dir).is_some()
+        }
+        // v2 discovers no script: only a declared, non-empty stop command holds it up.
+        AppFormat::V2 => stop
+            .and_then(|stop| stop.command.as_ref())
+            .is_some_and(|command| !is_empty_argv(command)),
+    };
     let command = if has_command {
         stop.map_or(DEFAULT_STOP_TIMEOUT, |stop| {
             configured_duration(stop.timeout.as_deref(), DEFAULT_STOP_TIMEOUT)
@@ -2135,8 +2668,9 @@ async fn run_stop_command(
     let spawned = spawn_phase(
         "stop",
         command,
+        ctx.config.format,
         ctx.work_dir,
-        &env.vars,
+        &env,
         Arc::clone(&ctx.log_line),
         reboot.as_ref(),
     );
@@ -2391,10 +2925,14 @@ fn stop_phase_command(ctx: &AppContext<'_>) -> Result<Option<CommandValue>> {
             .and_then(|stop| stop.command.clone()),
         timeout: None,
     };
-    Ok(
-        lifecycle_command("stop", ctx.app, Some(&configured), ctx.work_dir)?
-            .map(|command| command.value),
-    )
+    Ok(phase_command(
+        ctx.config.format,
+        "stop",
+        ctx.app,
+        Some(&configured),
+        ctx.work_dir,
+    )?
+    .map(|command| command.value))
 }
 
 /// The environment a stop-side hook runs in: the ordinary phase environment, rebuilt
@@ -2407,6 +2945,9 @@ async fn stop_phase_env(
     reason: &str,
     extra: &[(&str, String)],
 ) -> Result<PhaseEnv> {
+    if ctx.config.format == AppFormat::V2 {
+        return stop_phase_env_v2(ctx, reboot, pid, reason, extra).await;
+    }
     let mut env = phase_env(
         ctx.version,
         ctx.instance,
@@ -2425,6 +2966,58 @@ async fn stop_phase_env(
         .insert("APP_STOP_REASON".to_owned(), reason.to_owned());
     for (name, value) in extra {
         env.vars.insert((*name).to_owned(), value.clone());
+    }
+    Ok(env)
+}
+
+/// [`stop_phase_env`] for a format v2 app: the same facts, as the context tokens of
+/// `stop` or `stopped` (spec 214 *Context*) rather than `APP_*` variables. `extra` names
+/// them the v1 way, which is how the termination flow assembles them; it is non-empty
+/// for the stopped hook alone.
+async fn stop_phase_env_v2(
+    ctx: &AppContext<'_>,
+    reboot: Option<&PhaseReboot>,
+    pid: Option<u32>,
+    reason: &str,
+    extra: &[(&str, String)],
+) -> Result<PhaseEnv> {
+    let phase = if extra.is_empty() {
+        V2Phase::Stop
+    } else {
+        V2Phase::Stopped
+    };
+    let mut env = phase_env_v2(
+        phase,
+        ctx.config,
+        ctx.version,
+        ctx.instance,
+        ctx.params,
+        ctx.secrets,
+        None,
+        reboot,
+        None,
+    )
+    .await?;
+    let tokens = &mut env.tokens;
+    if let Some(pid) = pid {
+        insert_context_token(tokens, phase, ctx.config, V2Context::Pid, pid.to_string());
+    }
+    insert_context_token(
+        tokens,
+        phase,
+        ctx.config,
+        V2Context::StopReason,
+        reason.to_owned(),
+    );
+    for (name, value) in extra {
+        let context = match *name {
+            "APP_STOP_STATUS" => V2Context::StopStatus,
+            "APP_RUN_DURATION" => V2Context::RunDuration,
+            "APP_EXIT_SIGNAL" => V2Context::ExitSignal,
+            "APP_EXIT_CODE" => V2Context::ExitCode,
+            _ => continue,
+        };
+        insert_context_token(tokens, phase, ctx.config, context, value.clone());
     }
     Ok(env)
 }
@@ -2448,7 +3041,13 @@ pub async fn run_stopped_phase(
         return;
     }
     let configured = ctx.config.stopped.as_ref();
-    let command = match lifecycle_command("stopped", ctx.app, configured, ctx.work_dir) {
+    let command = match phase_command(
+        ctx.config.format,
+        "stopped",
+        ctx.app,
+        configured,
+        ctx.work_dir,
+    ) {
         Ok(Some(command)) => command,
         Ok(None) => return,
         Err(_) => {
@@ -2492,8 +3091,9 @@ pub async fn run_stopped_phase(
     let spawned = spawn_phase(
         "stopped",
         &command.value,
+        ctx.config.format,
         ctx.work_dir,
-        &env.vars,
+        &env,
         Arc::clone(&ctx.log_line),
         reboot.as_ref(),
     );
