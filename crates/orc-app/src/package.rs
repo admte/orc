@@ -265,6 +265,9 @@ fn build_plan(entries: &[InputEntry], options: PackageOptions) -> Result<Package
         ..options
     };
 
+    // An app of a format this build does not know cannot be checked, so it is not
+    // published by it.
+    let format = crate::app::AppFormat::from_artifact_type(&config_identity.artifact_type)?;
     let config_bytes = std::fs::read(&config_entry.path).map_err(|err| {
         CliError::Operational(format!("read {}: {err}", config_entry.path.display()))
     })?;
@@ -284,6 +287,9 @@ fn build_plan(entries: &[InputEntry], options: PackageOptions) -> Result<Package
             )));
         }
         payloads.push(payload_plan(entry, options)?);
+    }
+    if format == Some(crate::app::AppFormat::V2) {
+        check_v2_package(&config_bytes, &payloads)?;
     }
 
     let manifest_bytes = manifest_bytes(
@@ -444,6 +450,28 @@ fn read_annotations(entries: &[InputEntry]) -> Result<BTreeMap<String, String>> 
         annotations.insert(key.clone(), value.to_owned());
     }
     Ok(annotations)
+}
+
+/// The format v2 publish checks for a directory push (spec 214 *Publish checks*).
+///
+/// A pushed config is published as it is, so it must already hold plain values: no
+/// per-OS value is resolved here, and the build tokens are gone. The push names no
+/// platform the config is for, so the Unix rules hold too: a `./name` program must be a
+/// payload marked executable.
+fn check_v2_package(config_bytes: &[u8], payloads: &[PayloadPlan]) -> Result<()> {
+    let files: Vec<crate::v2::check::PackagedFile> = payloads
+        .iter()
+        .map(|payload| crate::v2::check::PackagedFile {
+            title: payload.title.clone(),
+            executable: payload.executable,
+        })
+        .collect();
+    let target = crate::v2::check::CheckTarget {
+        platform: None,
+        build_vars: BTreeSet::new(),
+        files: Some(&files),
+    };
+    crate::v2::check::check_config_bytes(config_bytes, &target).map_err(Into::into)
 }
 
 /// Validates an app config blob against the authoring contract: the closed params

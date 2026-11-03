@@ -1255,12 +1255,45 @@ impl RegistryClient {
         repository: &str,
         doc: &ManifestDocument,
     ) -> Result<Option<AppConfig>> {
-        let Some(config) = self.config_descriptor(repository, doc).await? else {
+        let Some(config) = self.config_descriptor(repository, doc, None).await? else {
             return Ok(None);
         };
+        self.decode_app_config(repository, &config).await.map(Some)
+    }
+
+    /// The app config of the manifest `doc` serves on `platform` (a label such as
+    /// `linux/amd64`), falling back to its first one, with the label of the manifest it
+    /// came from (`any` for a single manifest). A v2 app's commands differ per platform,
+    /// so a reader showing one says whose it shows.
+    ///
+    /// # Errors
+    ///
+    /// A registry or decode failure.
+    pub async fn app_config_for_platform(
+        &self,
+        repository: &str,
+        doc: &ManifestDocument,
+        platform: &str,
+    ) -> Result<Option<(AppConfig, String)>> {
+        let Some(config) = self
+            .config_descriptor(repository, doc, Some(platform))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let label = config
+            .platform
+            .as_ref()
+            .map_or_else(|| "any".to_owned(), crate::app::Platform::label);
+        let parsed = self.decode_app_config(repository, &config).await?;
+        Ok(Some((parsed, label)))
+    }
+
+    async fn decode_app_config(&self, repository: &str, config: &Descriptor) -> Result<AppConfig> {
         let blob = self.cached_blob(repository, &config.digest).await?;
-        serde_json::from_slice(&blob)
-            .map(Some)
+        let format =
+            crate::app::AppFormat::from_config_media_type(&config.media_type)?.unwrap_or_default();
+        AppConfig::parse(format, &blob)
             .map_err(|err| CliError::Operational(format!("decode app config: {err}")))
     }
 
@@ -1282,15 +1315,27 @@ impl RegistryClient {
         Ok(body)
     }
 
+    /// The config descriptor of `doc`, or of the index child for `platform` (the first
+    /// child when none matches or none is asked for). A child's descriptor comes back
+    /// carrying that child's platform.
     async fn config_descriptor(
         &self,
         repository: &str,
         doc: &ManifestDocument,
+        platform: Option<&str>,
     ) -> Result<Option<Descriptor>> {
         match doc {
             ManifestDocument::Manifest(manifest) => Ok(Some(manifest.config.clone())),
             ManifestDocument::Index(index) => {
-                let Some(child) = index.manifests.first() else {
+                let wanted = platform.and_then(|platform| {
+                    index.manifests.iter().find(|child| {
+                        child
+                            .platform
+                            .as_ref()
+                            .is_some_and(|item| item.label() == platform)
+                    })
+                });
+                let Some(child) = wanted.or_else(|| index.manifests.first()) else {
                     return Ok(None);
                 };
                 let response = self.get_manifest(repository, &child.digest).await?;
@@ -1299,7 +1344,10 @@ impl RegistryClient {
                         CliError::Operational(format!("decode child manifest: {err}"))
                     })?;
                 match child_doc {
-                    ManifestDocument::Manifest(manifest) => Ok(Some(manifest.config)),
+                    ManifestDocument::Manifest(manifest) => Ok(Some(Descriptor {
+                        platform: child.platform.clone(),
+                        ..manifest.config
+                    })),
                     ManifestDocument::Index(_) => Ok(None),
                 }
             }

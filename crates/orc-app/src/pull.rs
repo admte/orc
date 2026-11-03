@@ -3,10 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use crate::app::{
-    APP_ARTIFACT_TYPE, APP_CONFIG_MEDIA_TYPE, Descriptor, ImageManifest, ManifestDocument,
-    has_chunked_suffix,
-};
+#[cfg(test)]
+use crate::app::APP_ARTIFACT_TYPE;
+use crate::app::{AppFormat, Descriptor, ImageManifest, ManifestDocument, has_chunked_suffix};
 use crate::cache::{read_blob, write_blob};
 use crate::chunked::read_chunked_blob;
 use crate::error::{CliError, Result};
@@ -145,6 +144,11 @@ async fn materialize_resolved(
     dest: &Path,
     force: bool,
 ) -> Result<MaterializedPackage> {
+    // A directory reused across a re-push that changed the app's format must not keep
+    // the old format's config beside the new one.
+    if let Some(format) = AppFormat::from_config_media_type(&resolved.config_media_type)? {
+        crate::app::remove_other_configs(dest, format);
+    }
     let mut outputs = Vec::new();
     outputs.push(OutputFile {
         title: config_filename(&resolved.config_media_type)?,
@@ -404,14 +408,24 @@ async fn finish_resolve(
     .await
     .inspect_err(|err| report(registry, manifest_event(reference, failed(err))))?;
     report(registry, manifest_event(reference, ProgressPhase::Done));
-    if resolved.manifest.schema_version != 2
-        || resolved.manifest.artifact_type != APP_ARTIFACT_TYPE
-        || resolved.manifest.config.media_type != APP_CONFIG_MEDIA_TYPE
-    {
+    if resolved.manifest.schema_version != 2 {
         return Err(CliError::NotFound(format!(
             "{repository}:{reference} is not an ORC app artifact"
         )));
     }
+    // Either app format this runtime runs; an app of a newer one is refused by name,
+    // before anything is installed (spec 214 *Format version*).
+    AppFormat::of_manifest(
+        &resolved.manifest.artifact_type,
+        &resolved.manifest.config.media_type,
+    )
+    .map_err(|err| match err {
+        CliError::NotFound(_) => CliError::NotFound(format!(
+            "{repository}:{reference} is not an ORC app artifact"
+        )),
+        CliError::Usage(message) => CliError::Usage(format!("{repository}:{reference}: {message}")),
+        other => other,
+    })?;
     let config_media_type = resolved.manifest.config.media_type.clone();
     let config_digest = resolved.manifest.config.digest.clone();
     let config_bytes = fetch_blob(registry, repository, &resolved.manifest.config.digest).await?;

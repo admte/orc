@@ -6,9 +6,10 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 use crate::app::{
-    APP_ARTIFACT_TYPE, APP_CONFIG_MEDIA_TYPE, OCI_EMPTY_BLOB, OCI_EMPTY_MEDIA_TYPE,
-    OCI_IMAGE_INDEX, OCI_IMAGE_MANIFEST, OS_RECIPE_ARTIFACT_TYPE, OS_RECIPE_CONFIG_MEDIA_TYPE,
-    Platform, RECIPE_ARTIFACT_TYPE, RECIPE_MEDIA_TYPE,
+    APP_ARTIFACT_TYPE, APP_CONFIG_MEDIA_TYPE, APP_V2_ARTIFACT_TYPE, APP_V2_CONFIG_MEDIA_TYPE,
+    AppFormat, OCI_EMPTY_BLOB, OCI_EMPTY_MEDIA_TYPE, OCI_IMAGE_INDEX, OCI_IMAGE_MANIFEST,
+    OS_RECIPE_ARTIFACT_TYPE, OS_RECIPE_CONFIG_MEDIA_TYPE, Platform, RECIPE_ARTIFACT_TYPE,
+    RECIPE_MEDIA_TYPE,
 };
 use crate::error::{CliError, Result};
 use crate::progress::{ProgressEvent, ProgressKind, ProgressPhase, ProgressReporter};
@@ -150,6 +151,59 @@ impl RecipePlatform {
 #[derive(Debug)]
 struct BuildContext {
     platform: Option<RecipePlatform>,
+    /// The app format the recipe builds: v1's `{name}` interpolation, or v2's `${name}`
+    /// tokens and per-OS values (spec 214). v1 for every non-app artifact.
+    format: AppFormat,
+    /// A v2 recipe's build-time names: `os`, `arch` and every platform's `vars`.
+    build_vars: BTreeSet<String>,
+    /// The platform's label, `linux/amd64`, for a v2 refusal to name.
+    label: String,
+}
+
+impl BuildContext {
+    fn new(platform: Option<RecipePlatform>, recipe: &Recipe) -> Self {
+        let format = AppFormat::from_artifact_type(&recipe.artifact_type)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let label = platform.as_ref().map_or_else(
+            || "any platform".to_owned(),
+            |platform| platform.platform().label(),
+        );
+        Self {
+            platform,
+            format,
+            build_vars: crate::v2::build::build_var_names(
+                recipe.platforms.iter().map(|platform| &platform.vars),
+            ),
+            label,
+        }
+    }
+
+    fn build_platform(&self) -> Option<crate::v2::build::BuildPlatform<'_>> {
+        self.platform
+            .as_ref()
+            .map(|platform| crate::v2::build::BuildPlatform {
+                os: &platform.os,
+                arch: &platform.architecture,
+                label: &self.label,
+                vars: &platform.vars,
+            })
+    }
+
+    /// Resolves a recipe string outside `config:` — a file path, a sha256 — in the
+    /// recipe's own syntax.
+    fn interpolate(&self, input: &str, place: &str) -> Result<String> {
+        match self.format {
+            AppFormat::V1 => interpolate_string(input, self),
+            AppFormat::V2 => crate::v2::build::build_string(
+                input,
+                place,
+                self.build_platform(),
+                &self.build_vars,
+            ),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -342,7 +396,14 @@ async fn build_manifest(
     reporter: Option<&dyn ProgressReporter>,
     options: BuildOptions,
 ) -> Result<BuiltManifest> {
-    let config = interpolate_yaml(&recipe.config, context)?;
+    let config = match context.format {
+        AppFormat::V1 => interpolate_yaml(&recipe.config, context)?,
+        AppFormat::V2 => crate::v2::build::platform_config(
+            &recipe.config,
+            context.build_platform(),
+            &context.build_vars,
+        )?,
+    };
     let config_bytes = serde_json::to_vec(&config)
         .map_err(|err| CliError::Operational(format!("encode config JSON: {err}")))?;
     validate_config(&recipe.artifact_type, &config_bytes)?;
@@ -353,14 +414,19 @@ async fn build_manifest(
     }];
     let mut layers = Vec::new();
     let mut seen = BTreeSet::new();
-    for entry in &recipe.files {
-        let file = materialize_file(root, entry, context, reporter, options).await?;
+    let mut packaged = Vec::new();
+    for (index, entry) in recipe.files.iter().enumerate() {
+        let file = materialize_file(root, entry, index, context, reporter, options).await?;
         if !seen.insert(file.title.clone()) {
             return Err(CliError::Usage(format!(
                 "duplicate file path {:?}",
                 file.title
             )));
         }
+        packaged.push(crate::v2::check::PackagedFile {
+            title: file.title.clone(),
+            executable: file.executable,
+        });
         let digest = digest_bytes(&file.body);
         let mut annotations =
             BTreeMap::from([("org.opencontainers.image.title".to_owned(), file.title)]);
@@ -381,6 +447,17 @@ async fn build_manifest(
             digest,
             body: file.body,
         });
+    }
+    if context.format == AppFormat::V2 {
+        // The publish checks read the built config and the files as packaged, executable
+        // bits included (spec 214 *Publish checks*).
+        let platform = context.platform.as_ref().map(RecipePlatform::platform);
+        crate::v2::build::check_built(
+            &config_bytes,
+            platform.as_ref(),
+            &context.build_vars,
+            &packaged,
+        )?;
     }
     layers.sort_by(|left, right| {
         layer_title(left)
@@ -418,6 +495,7 @@ async fn build_manifest(
 async fn materialize_file(
     root: &Path,
     entry: &FileEntry,
+    index: usize,
     context: &BuildContext,
     reporter: Option<&dyn ProgressReporter>,
     options: BuildOptions,
@@ -433,7 +511,7 @@ async fn materialize_file(
             (path.as_str(), url.as_deref(), sha256.as_deref())
         }
     };
-    let interpolated_path = interpolate_string(path, context)?;
+    let interpolated_path = context.interpolate(path, &format!("files[{index}].path"))?;
     let relative = safe_relative_path(&interpolated_path)?;
     let title = relative
         .iter()
@@ -442,7 +520,7 @@ async fn materialize_file(
         .join("/");
     let local = root.join(&relative);
     let expected = sha256
-        .map(|value| interpolate_string(value, context))
+        .map(|value| context.interpolate(value, &format!("files[{index}].sha256")))
         .transpose()?;
     let body = file_bytes(&local, url, expected.as_deref(), reporter, &title, options).await?;
     let executable = is_executable(&local);
@@ -456,12 +534,12 @@ async fn materialize_file(
 /// Reports whether every `files:` entry without a remote `url:` resolves to an
 /// existing local file for this context; `url:`-sourced entries count as present.
 fn local_files_present(root: &Path, recipe: &Recipe, context: &BuildContext) -> Result<bool> {
-    for entry in &recipe.files {
+    for (index, entry) in recipe.files.iter().enumerate() {
         let path = match entry {
             FileEntry::Object { url: Some(_), .. } => continue,
             FileEntry::Path(path) | FileEntry::Object { path, .. } => path.as_str(),
         };
-        let interpolated_path = interpolate_string(path, context)?;
+        let interpolated_path = context.interpolate(path, &format!("files[{index}].path"))?;
         let relative = safe_relative_path(&interpolated_path)?;
         if !root.join(relative).exists() {
             return Ok(false);
@@ -557,9 +635,9 @@ fn report_file(reporter: Option<&dyn ProgressReporter>, title: &str, phase: &Pro
 fn build_contexts(recipe: &Recipe, selected: &[Platform]) -> Result<Vec<BuildContext>> {
     if recipe.platforms.is_empty() {
         if !selected.is_empty() {
-            return Ok(vec![BuildContext { platform: None }]);
+            return Ok(vec![BuildContext::new(None, recipe)]);
         }
-        return Ok(vec![BuildContext { platform: None }]);
+        return Ok(vec![BuildContext::new(None, recipe)]);
     }
     let mut contexts = Vec::new();
     for platform in &recipe.platforms {
@@ -568,9 +646,7 @@ fn build_contexts(recipe: &Recipe, selected: &[Platform]) -> Result<Vec<BuildCon
                 .iter()
                 .any(|selected| selected.label() == platform.platform().label())
         {
-            contexts.push(BuildContext {
-                platform: Some(platform.clone()),
-            });
+            contexts.push(BuildContext::new(Some(platform.clone()), recipe));
         }
     }
     if contexts.is_empty() {
@@ -677,6 +753,7 @@ fn safe_relative_path(path: &str) -> Result<PathBuf> {
 fn config_media_type(artifact_type: &str) -> Result<&'static str> {
     match artifact_type {
         APP_ARTIFACT_TYPE => Ok(APP_CONFIG_MEDIA_TYPE),
+        APP_V2_ARTIFACT_TYPE => Ok(APP_V2_CONFIG_MEDIA_TYPE),
         KVM_ARTIFACT_TYPE => Ok(KVM_CONFIG_MEDIA_TYPE),
         OS_RECIPE_ARTIFACT_TYPE => Ok(OS_RECIPE_CONFIG_MEDIA_TYPE),
         _ => Err(CliError::Usage(format!(
@@ -686,7 +763,7 @@ fn config_media_type(artifact_type: &str) -> Result<&'static str> {
 }
 
 fn validate_config(artifact_type: &str, body: &[u8]) -> Result<()> {
-    if artifact_type == APP_ARTIFACT_TYPE {
+    if artifact_type == APP_ARTIFACT_TYPE || artifact_type == APP_V2_ARTIFACT_TYPE {
         serde_json::from_slice::<crate::app::AppConfig>(body)
             .map_err(|err| CliError::Usage(format!("invalid app config: {err}")))?;
         // The recipe `config:` map becomes the config blob verbatim, so it answers to the

@@ -5,25 +5,208 @@ use serde::{Deserialize, Serialize};
 pub const APP_ARTIFACT_TYPE: &str = "application/vnd.orc8r.app.v1";
 pub const APP_CONFIG_MEDIA_TYPE: &str = "application/vnd.orc8r.app.config.v1+json";
 
+/// Format v2 (spec 214): params reach a phase only as the tokens its argv names.
+pub const APP_V2_ARTIFACT_TYPE: &str = "application/vnd.orc8r.app.v2";
+pub const APP_V2_CONFIG_MEDIA_TYPE: &str = "application/vnd.orc8r.app.config.v2+json";
+
 /// The app's config blob as it is materialized into the app's work directory.
 ///
 /// Every runtime that starts an app reads it from here — including the runtime
 /// re-invoked as a start shim by a service manager, which has nothing else to go on.
 pub const CONFIG_FILE: &str = "app.config.v1.json";
 
-/// Reads the app config a work directory carries.
+/// A format v2 app's config blob in its work directory. The file name is the format
+/// marker: everything that later reads an installed app (the start shim, uninstall, a
+/// rollback check) knows from it which contract the app was written against.
+pub const CONFIG_FILE_V2: &str = "app.config.v2.json";
+
+const APP_ARTIFACT_PREFIX: &str = "application/vnd.orc8r.app.v";
+const APP_CONFIG_PREFIX: &str = "application/vnd.orc8r.app.config.v";
+
+/// Which app package contract a config was written against.
+///
+/// The config blob does not say: its media type, the manifest's `artifactType` and the
+/// config file's name in a work directory do. So every place that turns bytes into an
+/// [`AppConfig`] is handed the format by whoever knew it ([`AppConfig::parse`],
+/// [`read_config`]); a config decoded any other way is v1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppFormat {
+    /// Spec 142: params as environment variables, string or argv commands, packaged
+    /// lifecycle scripts discovered by name.
+    #[default]
+    V1,
+    /// Spec 214: params as the argv tokens a command names, argv commands only, no
+    /// script discovery.
+    V2,
+}
+
+impl AppFormat {
+    /// Every format this runtime runs, oldest first.
+    pub const ALL: [Self; 2] = [Self::V1, Self::V2];
+
+    #[must_use]
+    pub const fn artifact_type(self) -> &'static str {
+        match self {
+            Self::V1 => APP_ARTIFACT_TYPE,
+            Self::V2 => APP_V2_ARTIFACT_TYPE,
+        }
+    }
+
+    #[must_use]
+    pub const fn config_media_type(self) -> &'static str {
+        match self {
+            Self::V1 => APP_CONFIG_MEDIA_TYPE,
+            Self::V2 => APP_V2_CONFIG_MEDIA_TYPE,
+        }
+    }
+
+    /// The name the config blob is materialized under in a work directory.
+    #[must_use]
+    pub const fn config_file(self) -> &'static str {
+        match self {
+            Self::V1 => CONFIG_FILE,
+            Self::V2 => CONFIG_FILE_V2,
+        }
+    }
+
+    /// `v1` or `v2`, the way the spec and an operator name it.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+
+    /// The format an app `artifactType` names, or `None` when it names no app at all.
+    ///
+    /// # Errors
+    ///
+    /// An app artifact of a format this runtime does not run is refused by name, so an
+    /// operator reads which format the app needs rather than "not an app".
+    pub fn from_artifact_type(artifact_type: &str) -> crate::error::Result<Option<Self>> {
+        Self::named(artifact_type, APP_ARTIFACT_PREFIX, "", artifact_type)
+    }
+
+    /// The format an app config media type names, or `None` when it names no app config.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an app config of a format this runtime does not run, naming it.
+    pub fn from_config_media_type(media_type: &str) -> crate::error::Result<Option<Self>> {
+        Self::named(media_type, APP_CONFIG_PREFIX, "+json", media_type)
+    }
+
+    /// The format of an app manifest: its `artifactType` and config media type must name
+    /// the same known format.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::CliError::NotFound`] when the manifest is not an ORC app at all or
+    /// its two types disagree; [`crate::error::CliError::Usage`] naming the format when
+    /// it is an app of a format this runtime does not run.
+    pub fn of_manifest(artifact_type: &str, config_media_type: &str) -> crate::error::Result<Self> {
+        let artifact = Self::from_artifact_type(artifact_type)?;
+        let config = Self::from_config_media_type(config_media_type)?;
+        match (artifact, config) {
+            (Some(artifact), Some(config)) if artifact == config => Ok(artifact),
+            _ => Err(crate::error::CliError::NotFound(
+                "not an ORC app artifact".to_owned(),
+            )),
+        }
+    }
+
+    fn named(
+        value: &str,
+        prefix: &str,
+        suffix: &str,
+        shown: &str,
+    ) -> crate::error::Result<Option<Self>> {
+        let Some(version) = value
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        else {
+            return Ok(None);
+        };
+        match version {
+            "1" => Ok(Some(Self::V1)),
+            "2" => Ok(Some(Self::V2)),
+            other if !other.is_empty() && other.bytes().all(|byte| byte.is_ascii_digit()) => {
+                Err(unknown_format(other, shown))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+impl std::fmt::Display for AppFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// The refusal a runtime gives an app of a format it does not run (spec 214 *Format
+/// version*): before install, naming the format.
+fn unknown_format(version: &str, shown: &str) -> crate::error::CliError {
+    let known = AppFormat::ALL
+        .iter()
+        .map(|format| format.label())
+        .collect::<Vec<_>>()
+        .join(" and ");
+    crate::error::CliError::Usage(format!(
+        "this app needs app format v{version} ({shown}); this orc runs app formats {known}; \
+         upgrade orc to run it"
+    ))
+}
+
+/// Reads the app config a work directory carries, in the format its file name says.
 ///
 /// # Errors
 ///
-/// Fails when the file is unreadable or is not a config this runtime understands.
+/// Fails when the file is unreadable, is not a config this runtime understands, or the
+/// directory holds configs of two formats at once.
 pub fn read_config(work_dir: &std::path::Path) -> crate::error::Result<AppConfig> {
-    let path = work_dir.join(CONFIG_FILE);
+    let format = installed_format(work_dir)?;
+    let path = work_dir.join(format.config_file());
     let bytes = std::fs::read(&path).map_err(|err| {
         crate::error::CliError::Operational(format!("read {}: {err}", path.display()))
     })?;
-    serde_json::from_slice(&bytes).map_err(|err| {
+    AppConfig::parse(format, &bytes).map_err(|err| {
         crate::error::CliError::Operational(format!("parse {}: {err}", path.display()))
     })
+}
+
+/// The format of the app installed in a work directory: whichever config file it holds.
+/// A directory with neither reads as v1, so the error names the file a v1 runtime looks
+/// for.
+///
+/// # Errors
+///
+/// Refuses a directory holding both formats' configs: which one the app is cannot be
+/// known, and running the wrong contract is worse than not running.
+pub fn installed_format(work_dir: &std::path::Path) -> crate::error::Result<AppFormat> {
+    let v1 = work_dir.join(CONFIG_FILE).exists();
+    let v2 = work_dir.join(CONFIG_FILE_V2).exists();
+    match (v1, v2) {
+        (true, true) => Err(crate::error::CliError::Operational(format!(
+            "{} holds both {CONFIG_FILE} and {CONFIG_FILE_V2}; reinstall the app",
+            work_dir.display()
+        ))),
+        (false, true) => Ok(AppFormat::V2),
+        _ => Ok(AppFormat::V1),
+    }
+}
+
+/// Removes the config file of every app format other than `format` from a work
+/// directory, so a directory reused across a re-push that changed the format holds
+/// exactly one config. Best-effort: a missing file is the usual case.
+pub fn remove_other_configs(work_dir: &std::path::Path, format: AppFormat) {
+    for other in AppFormat::ALL {
+        if other != format {
+            let _ = std::fs::remove_file(work_dir.join(other.config_file()));
+        }
+    }
 }
 
 /// OS recipe artifact (spec 134/137): a data-only recipe whose config blob is an
@@ -108,6 +291,11 @@ where
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AppConfig {
+    /// The contract the config was written against. Not part of the blob: set by
+    /// [`AppConfig::parse`] and [`read_config`] from the media type or file name that
+    /// carried it, and v1 for a config decoded any other way.
+    #[serde(skip)]
+    pub format: AppFormat,
     #[serde(default)]
     pub params: Option<ParamSchema>,
     #[serde(default, deserialize_with = "null_default")]
@@ -137,6 +325,35 @@ pub struct AppConfig {
     /// host, never a limit; absent means [`crate::persist::FOOTPRINT_DEFAULT_GB`].
     #[serde(default)]
     pub footprint_gb: Option<u64>,
+}
+
+impl AppConfig {
+    /// Decodes a config blob of a known format.
+    ///
+    /// # Errors
+    ///
+    /// The JSON error when the blob does not decode as an app config.
+    pub fn parse(format: AppFormat, bytes: &[u8]) -> std::result::Result<Self, serde_json::Error> {
+        let mut config: Self = serde_json::from_slice(bytes)?;
+        config.format = format;
+        Ok(config)
+    }
+
+    /// Decodes a config blob carried under `media_type`.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a media type naming no app config (or an app format this runtime does not
+    /// run, by name), and a blob that does not decode.
+    pub fn parse_media_type(media_type: &str, bytes: &[u8]) -> crate::error::Result<Self> {
+        let format = AppFormat::from_config_media_type(media_type)?.ok_or_else(|| {
+            crate::error::CliError::Operational(format!(
+                "unsupported app config media type {media_type}"
+            ))
+        })?;
+        Self::parse(format, bytes)
+            .map_err(|err| crate::error::CliError::Operational(format!("decode app config: {err}")))
+    }
 }
 
 /// The paths an app persists, plus the optional hooks that bracket a capture.
@@ -785,17 +1002,41 @@ impl ManifestDocument {
         }
     }
 
+    /// Whether this is an ORC app of a format this runtime runs.
     #[must_use]
     pub fn is_orc_app(&self) -> bool {
+        self.app_format().is_ok_and(|format| format.is_some())
+    }
+
+    /// The app format this document carries: `None` when it is no ORC app at all.
+    ///
+    /// An index states its format in `artifactType` only when its publisher set one; an
+    /// index without one reads as an app whose children say which format they are.
+    ///
+    /// # Errors
+    ///
+    /// An app of a format this runtime does not run is refused by name.
+    pub fn app_format(&self) -> crate::error::Result<Option<AppFormat>> {
         match self {
             Self::Manifest(manifest) => {
-                manifest.schema_version == 2
-                    && manifest.artifact_type == APP_ARTIFACT_TYPE
-                    && manifest.config.media_type == APP_CONFIG_MEDIA_TYPE
+                if manifest.schema_version != 2 {
+                    return Ok(None);
+                }
+                let artifact = AppFormat::from_artifact_type(&manifest.artifact_type)?;
+                let config = AppFormat::from_config_media_type(&manifest.config.media_type)?;
+                Ok(match (artifact, config) {
+                    (Some(artifact), Some(config)) if artifact == config => Some(artifact),
+                    _ => None,
+                })
             }
             Self::Index(index) => {
-                index.schema_version == 2
-                    && (index.artifact_type.is_empty() || index.artifact_type == APP_ARTIFACT_TYPE)
+                if index.schema_version != 2 {
+                    return Ok(None);
+                }
+                if index.artifact_type.is_empty() {
+                    return Ok(Some(AppFormat::V1));
+                }
+                AppFormat::from_artifact_type(&index.artifact_type)
             }
         }
     }
