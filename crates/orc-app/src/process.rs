@@ -4,12 +4,14 @@
 
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
 
 use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, BufReader};
 use tokio::process::{Child, Command};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{CliError, Result};
 use crate::service::{ServiceBackend, ServiceState, ServiceStatus};
@@ -353,6 +355,70 @@ async fn taskkill_tree(child: &Child) {
         .stderr(Stdio::null())
         .status()
         .await;
+}
+
+/// An operator's interrupt of a foreground command, handed to the phases it runs.
+///
+/// A phase that sees it raised sends `SIGINT` to its process group, gives the group
+/// [`crate::lifecycle::SHUTDOWN_GRACE`], kills what is left, and fails with
+/// [`CliError::Interrupted`]. Once raised it stays raised, so a command the operator
+/// interrupted starts no further phase. A runtime with no operator at a terminal, such
+/// as the agent or a service, passes none.
+#[derive(Debug, Clone, Default)]
+pub struct PhaseInterrupt {
+    raised: CancellationToken,
+    signal: Arc<AtomicI32>,
+}
+
+impl PhaseInterrupt {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records that `signal` interrupted the command. The first signal is the one kept.
+    pub fn raise(&self, signal: i32) {
+        let _ = self
+            .signal
+            .compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+        self.raised.cancel();
+    }
+
+    /// The signal that interrupted the command, once one has.
+    #[must_use]
+    pub fn signal(&self) -> Option<i32> {
+        self.raised
+            .is_cancelled()
+            .then(|| self.signal.load(Ordering::SeqCst))
+    }
+
+    /// Resolves with the interrupting signal once the command is interrupted.
+    pub async fn raised(&self) -> i32 {
+        self.raised.cancelled().await;
+        self.signal.load(Ordering::SeqCst)
+    }
+
+    /// Fails with [`CliError::Interrupted`] for `phase` once the command is interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::Interrupted`] when the interrupt has been raised.
+    pub fn check(&self, phase: &str) -> Result<()> {
+        self.signal().map_or(Ok(()), |signal| {
+            Err(CliError::Interrupted {
+                phase: phase.to_owned(),
+                signal,
+            })
+        })
+    }
+}
+
+/// Resolves with the interrupting signal once `interrupt` is raised; never, without one.
+pub async fn interrupted(interrupt: Option<&PhaseInterrupt>) -> i32 {
+    match interrupt {
+        Some(interrupt) => interrupt.raised().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Child stream that produced a log line.

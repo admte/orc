@@ -468,6 +468,7 @@ fn reply_for_error(err: &CliError) -> Reply {
         CliError::Auth(_) | CliError::Usage(_) => Reply::NotAllowed,
         CliError::NotFound(_) => Reply::HostUnreachable,
         CliError::Conflict(_) | CliError::Operational(_) => Reply::ConnectionRefused,
+        CliError::Interrupted { .. } => Reply::GeneralFailure,
     }
 }
 

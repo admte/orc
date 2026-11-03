@@ -305,6 +305,92 @@ fn uninstalling_after_a_foreground_stop_removes_everything() {
     assert_eq!(rows, json!([]));
 }
 
+/// Ctrl-C or `SIGTERM` to a foreground `orc install` ends the install phase too, with
+/// whatever its shell started, and `orc` exits with the conventional status.
+#[cfg(unix)]
+#[test]
+fn interrupting_an_install_ends_its_phase_too() {
+    for (signal, status) in [("-INT", 130), ("-TERM", 143)] {
+        let dirs = TestDirs::new();
+        let pid_file = dirs.logs.path().join("sleeper.pid");
+        let recipe = format!(
+            "artifactType: application/vnd.orc8r.app.v1\n\
+             config:\n  \
+               install:\n    \
+                 command: \"sh -c 'sleep 600 & echo $! > {}; wait'\"\n  \
+               start:\n    \
+                 command: [\"true\"]\n",
+            pid_file.display()
+        );
+        let package = tempfile::tempdir().expect("package dir");
+        std::fs::write(package.path().join("artifact.yaml"), recipe).expect("recipe");
+        let build = run_orc(
+            &dirs,
+            &[
+                "--registry",
+                UNREACHABLE_PREFIX,
+                "build",
+                package.path().to_str().expect("package path"),
+                "--tag",
+                "installer",
+            ],
+        );
+        assert_success(&build);
+
+        let install = orc_command(
+            &dirs,
+            &["--registry", UNREACHABLE_PREFIX, "install", "installer"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn orc install");
+        wait_until("the install phase to start its job", || {
+            std::fs::read_to_string(&pid_file).is_ok_and(|text| !text.trim().is_empty())
+        });
+        let sleeper = std::fs::read_to_string(&pid_file).expect("pid file");
+        let sleeper = sleeper.trim().to_owned();
+        let sent = Command::new("kill")
+            .args([signal, &install.id().to_string()])
+            .status()
+            .expect("signal orc");
+        assert!(sent.success());
+        let output = install.wait_with_output().expect("wait for orc install");
+
+        let gone = (0..200).any(|_| {
+            let alive = Command::new("kill")
+                .args(["-0", &sleeper])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            let zombie =
+                std::fs::read_to_string(format!("/proc/{sleeper}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(')')
+                        .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+                });
+            if alive && !zombie {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            !alive || zombie
+        });
+        if !gone {
+            let _ = Command::new("kill").args(["-KILL", &sleeper]).status();
+        }
+        assert!(
+            gone,
+            "the install phase's job outlived `orc install` ({signal})"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(status),
+            "{signal}\n{}",
+            output_text(&output)
+        );
+        assert_stderr_contains(&output, "install phase interrupted by the operator");
+    }
+}
+
 // ─── harness ────────────────────────────────────────────────────────────────────
 
 struct TestDirs {

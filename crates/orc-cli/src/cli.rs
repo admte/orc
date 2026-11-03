@@ -55,7 +55,9 @@ use orc_app::lifecycle::{
     StopStatus, StoppedReason, managed_service_spec, run_stopped_phase, stop_sequence,
     write_app_env,
 };
-use orc_app::process::{AppProcess, LogLine, LogStream, spawn_piped_app};
+use orc_app::process::{
+    AppProcess, LogLine, LogStream, PhaseInterrupt, interrupted, spawn_piped_app,
+};
 use orc_app::progress::{ProgressEvent, ProgressKind, ProgressPhase, ProgressReporter};
 use orc_app::reboot::{PhaseOutcome, PhaseReboot, RebootAction, RebootExecutor};
 use orc_app::service::ServiceBackend;
@@ -2111,6 +2113,7 @@ async fn install_phase_under_reboot(
             orc_app::reboot::MAX_PHASE_REBOOTS
         );
     }
+    let operator = OperatorInterrupts::watch()?;
     // The CLI has no secret resolver; `sec:` tokens stay unresolved here.
     run_install_phase(
         app,
@@ -2124,6 +2127,7 @@ async fn install_phase_under_reboot(
         terminal_log_line(),
         Some(&reboot),
         None,
+        operator.source(),
     )
     .await
 }
@@ -2928,8 +2932,8 @@ async fn supervise_foreground(
                     Err(CliError::Operational(format!("run start phase: {err}"))),
                 ),
             };
-            run_stopped_phase(ctx, StoppedReason::Exit, StopStatus::Skipped, &exit, None).await;
-            (state, result)
+            let hook = stopped_hook(ctx, StoppedReason::Exit, StopStatus::Skipped, &exit, None);
+            (state, result.and(hook.await))
         }
         Ending::Interrupted(interrupt) => {
             let force = CancellationToken::new();
@@ -2967,17 +2971,27 @@ async fn supervise_foreground(
             drains.flush().await;
             report_stop(app, version, &outcome, settings);
             let cap = force.is_cancelled().then_some(FORCED_STOPPED_TIMEOUT);
-            run_stopped_phase(
-                ctx,
-                StoppedReason::Stopped(StopReason::Stop),
-                outcome.stop_status,
-                &outcome.exit,
-                cap,
-            )
-            .await;
-            ("stopped", Ok(()))
+            let reason = StoppedReason::Stopped(StopReason::Stop);
+            let hook = stopped_hook(ctx, reason, outcome.stop_status, &outcome.exit, cap);
+            ("stopped", hook.await)
         }
     }
+}
+
+/// Runs a foreground app's stopped hook, ending it if the operator interrupts it.
+///
+/// Watched only from the hook's start: the interrupts that stopped the app were the
+/// operator's ask to stop it, not to cut its stopped hook short.
+async fn stopped_hook(
+    ctx: &AppContext<'_>,
+    reason: StoppedReason,
+    stop_status: StopStatus,
+    exit: &ExitInfo,
+    cap: Option<Duration>,
+) -> Result<()> {
+    let operator = OperatorInterrupts::watch()?;
+    run_stopped_phase(ctx, reason, stop_status, exit, cap, operator.source()).await;
+    operator.check("stopped")
 }
 
 /// Hands the app to the platform's service manager and returns: the manager holds it from
@@ -3106,6 +3120,65 @@ impl Interrupts {
             let _ = tokio::signal::ctrl_c().await;
             Interrupt::Graceful
         }
+    }
+}
+
+/// Hands the operator's Ctrl-C or `SIGTERM` to the phases a foreground command runs, so
+/// an interrupt ends the phase's whole process group rather than only this process.
+///
+/// Watched only while a command has phases to run: once watched, the signal no longer
+/// ends this process by itself, and the command ends instead with the interrupted
+/// phase's error, `130` for Ctrl-C and `143` for `SIGTERM`. Windows keeps its console's
+/// own Ctrl-C handling.
+struct OperatorInterrupts {
+    interrupt: PhaseInterrupt,
+    #[cfg(unix)]
+    watch: tokio::task::JoinHandle<()>,
+}
+
+impl OperatorInterrupts {
+    fn watch() -> Result<Self> {
+        let interrupt = PhaseInterrupt::new();
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let listen = |kind: SignalKind, name: &str| {
+                signal(kind)
+                    .map_err(|err| CliError::Operational(format!("listen for {name}: {err}")))
+            };
+            let mut interrupts = listen(SignalKind::interrupt(), "interrupts")?;
+            let mut terminations = listen(SignalKind::terminate(), "termination requests")?;
+            let raised = interrupt.clone();
+            let watch = tokio::spawn(async move {
+                let signal = tokio::select! {
+                    _ = interrupts.recv() => libc::SIGINT,
+                    _ = terminations.recv() => libc::SIGTERM,
+                };
+                raised.raise(signal);
+            });
+            Ok(Self { interrupt, watch })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self { interrupt })
+        }
+    }
+
+    /// What the phases are handed: the interrupt on Unix, nothing on Windows.
+    fn source(&self) -> Option<&PhaseInterrupt> {
+        cfg!(unix).then_some(&self.interrupt)
+    }
+
+    /// Fails as `phase` interrupted once the operator has interrupted the command.
+    fn check(&self, phase: &str) -> Result<()> {
+        self.interrupt.check(phase)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OperatorInterrupts {
+    fn drop(&mut self) {
+        self.watch.abort();
     }
 }
 
@@ -3452,6 +3525,7 @@ async fn stop(args: &AppArg, settings: &CliSettings, config: &StoredConfig) -> R
             let name = name.to_owned();
             let backend = service_backend(&app, &version)?;
             let state_dir = orc_app::state::state_dir()?;
+            let operator = OperatorInterrupts::watch()?;
             let stopped = stop_service(
                 &target,
                 &name,
@@ -3460,9 +3534,11 @@ async fn stop(args: &AppArg, settings: &CliSettings, config: &StoredConfig) -> R
                 settings,
                 &backend,
                 &state_dir,
+                operator.source(),
             )
             .await?;
-            write_install_record(&stopped)
+            write_install_record(&stopped)?;
+            operator.check("stop")
         }
         None => stop_subprocess(&app, target, args.force, settings).await,
     }
@@ -3473,6 +3549,10 @@ async fn stop(args: &AppArg, settings: &CliSettings, config: &StoredConfig) -> R
 /// kill, the stopped hook — can run wherever the operator typed the command.
 ///
 /// Returns the record as it now stands, recorded stopped.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the app, its manager and the operator's asks are each required"
+)]
 async fn stop_service(
     target: &StopTarget,
     name: &str,
@@ -3481,6 +3561,7 @@ async fn stop_service(
     settings: &CliSettings,
     backend: &Arc<dyn ServiceBackend>,
     state_dir: &Path,
+    interrupt: Option<&PhaseInterrupt>,
 ) -> Result<InstallRecord> {
     let (app, version) = (target.app.as_str(), target.version.as_str());
     let mut record = target.record.clone();
@@ -3529,7 +3610,22 @@ async fn stop_service(
             eprintln!("Running the stop command while the app is still up");
         }
     }
-    let outcome = stop_sequence(&ctx, &mut process, reason, &token).await;
+    // The operator interrupting this command stops waiting, as `--force` does: the
+    // stop command's group and the service are ended now.
+    let outcome = {
+        let stopping = stop_sequence(&ctx, &mut process, reason, &token);
+        tokio::pin!(stopping);
+        tokio::select! {
+            outcome = &mut stopping => outcome,
+            _ = interrupted(interrupt) => {
+                token.cancel();
+                if !settings.quiet {
+                    eprintln!("Ending {app}:{version} now, as interrupted");
+                }
+                stopping.await
+            }
+        }
+    };
     report_stop(app, version, &outcome, settings);
     run_stopped_phase(
         &ctx,
@@ -3537,6 +3633,7 @@ async fn stop_service(
         outcome.stop_status,
         &outcome.exit,
         force.then_some(FORCED_STOPPED_TIMEOUT),
+        interrupt,
     )
     .await;
     mark_stopped(&mut record);
@@ -3731,6 +3828,7 @@ async fn uninstall(args: AppArg, settings: &CliSettings, config: &StoredConfig) 
     // What a version line uninstalls is the install it resolved to, all of it: the files,
     // the record, and the app's own uninstall phase in between.
     let version = target.version.clone();
+    let operator = OperatorInterrupts::watch()?;
     if !is_not_running_state(&target.record.state) {
         match target.mode.as_ref().and_then(RunMode::service_name) {
             // The manager holds the app, so this process can end it and carry on.
@@ -3746,11 +3844,14 @@ async fn uninstall(args: AppArg, settings: &CliSettings, config: &StoredConfig) 
                     settings,
                     &backend,
                     &state_dir,
+                    operator.source(),
                 )
                 .await?;
                 // Persisted before the uninstall phase runs: an uninstall that fails
                 // half way leaves a record a retry can read, and the app is stopped.
                 write_install_record(&target.record)?;
+                // Interrupted while it stopped: the app is down, and nothing is removed.
+                operator.check("stop")?;
             }
             // A foreground app belongs to the process supervising it, and that is not
             // this one: removing the files under a running app is not an uninstall.
@@ -3786,6 +3887,7 @@ async fn uninstall(args: AppArg, settings: &CliSettings, config: &StoredConfig) 
         &target.work_dir,
         terminal_log_line(),
         None,
+        operator.source(),
     )
     .await?;
     if target.work_dir.exists() {
@@ -4405,6 +4507,7 @@ mod tests {
             &quiet_settings(),
             &backend,
             state.path(),
+            None,
         )
         .await
         .expect("stop the service");
@@ -4440,6 +4543,7 @@ mod tests {
             &quiet_settings(),
             &backend,
             state.path(),
+            None,
         )
         .await
         .expect("stop the service");

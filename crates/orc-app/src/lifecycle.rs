@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 use crate::app::{AppConfig, CommandPhase, CommandValue, ParamLifetime};
 use crate::error::{CliError, Result};
 use crate::params::{ParsedParam, ParsedParamValue};
-use crate::process::{AppProcess, LogLine, LogStream, StopAsk, StopSignal, drain_lines};
+use crate::process::{
+    AppProcess, LogLine, LogStream, PhaseInterrupt, StopAsk, StopSignal, drain_lines, interrupted,
+};
 use crate::reboot::{PhaseOutcome, PhaseReboot};
 use crate::service::{self, RestartPolicy, ServiceSpec};
 
@@ -166,6 +168,7 @@ pub async fn run_install_phase(
     log_line: LogLine,
     reboot: Option<&PhaseReboot>,
     persist_state: Option<PersistState>,
+    interrupt: Option<&PhaseInterrupt>,
 ) -> Result<PhaseOutcome> {
     let Some(command) = lifecycle_command("install", app, config.install.as_ref(), work_dir)?
     else {
@@ -184,7 +187,10 @@ pub async fn run_install_phase(
         persist_state,
     )
     .await?;
-    let result = run_command("install", command, work_dir, &env.vars, log_line, reboot).await;
+    let result = run_command(
+        "install", command, work_dir, &env.vars, log_line, reboot, interrupt,
+    )
+    .await;
     for path in env.startup_files.into_iter().chain(env.param_files) {
         let _ = std::fs::remove_file(path);
     }
@@ -242,7 +248,7 @@ pub async fn run_capture_hook_phase(
         None,
     )
     .await?;
-    let result = run_command(phase, command, work_dir, &env.vars, log_line, None).await;
+    let result = run_command(phase, command, work_dir, &env.vars, log_line, None, None).await;
     for path in env.startup_files.into_iter().chain(env.param_files) {
         let _ = std::fs::remove_file(path);
     }
@@ -262,13 +268,23 @@ pub async fn run_uninstall_phase(
     work_dir: &Path,
     log_line: LogLine,
     reboot: Option<&PhaseReboot>,
+    interrupt: Option<&PhaseInterrupt>,
 ) -> Result<PhaseOutcome> {
     let Some(command) = lifecycle_command("uninstall", app, config.uninstall.as_ref(), work_dir)?
     else {
         return phase_outcome(reboot, &Ok(()));
     };
     let env = durable_phase_env(version, instance, params, reboot, declared_service(config))?;
-    let result = run_command("uninstall", command, work_dir, &env, log_line, reboot).await;
+    let result = run_command(
+        "uninstall",
+        command,
+        work_dir,
+        &env,
+        log_line,
+        reboot,
+        interrupt,
+    )
+    .await;
     let outcome = phase_outcome(reboot, &result)?;
     result?;
     Ok(outcome)
@@ -313,6 +329,7 @@ pub async fn run_start_phase(
         &env.vars,
         log_line,
         reboot,
+        None,
     )
     .await;
     for path in env.startup_files.into_iter().chain(env.param_files) {
@@ -1404,6 +1421,67 @@ impl PhaseProcess {
         let _ = self.stdout_drain.await;
         let _ = self.stderr_drain.await;
     }
+
+    /// Ends the command because the operator interrupted it: `SIGINT` to its process
+    /// group, [`SHUTDOWN_GRACE`] for the group to let go of the output pipes, then
+    /// `SIGKILL` to whatever is left, and the reap.
+    ///
+    /// The command is reaped only after the kill. Until then it still leads its group,
+    /// so the kill reaches what it started even when it has already exited itself: a
+    /// shell's background jobs ignore `SIGINT` and outlive the shell that started them.
+    async fn interrupt(self) {
+        let Self {
+            mut child,
+            stdout_drain,
+            stderr_drain,
+        } = self;
+        let _ = AppProcess::subprocess(&mut child, std::time::Instant::now())
+            .signal(StopSignal::Int)
+            .await;
+        let drains = async {
+            let _ = stdout_drain.await;
+            let _ = stderr_drain.await;
+        };
+        tokio::pin!(drains);
+        let drained = tokio::time::timeout(SHUTDOWN_GRACE, &mut drains)
+            .await
+            .is_ok();
+        AppProcess::subprocess(&mut child, std::time::Instant::now())
+            .kill()
+            .await;
+        let _ = child.wait().await;
+        if !drained {
+            drains.await;
+        }
+    }
+}
+
+/// How a phase command came to an end.
+enum PhaseEnd {
+    Exited(std::io::Result<ExitStatus>),
+    TimedOut,
+    Interrupted(i32),
+}
+
+/// Waits for a phase command until it exits, its timeout runs out, or the operator
+/// interrupts it.
+async fn wait_phase(
+    process: &mut PhaseProcess,
+    timeout: Option<Duration>,
+    interrupt: Option<&PhaseInterrupt>,
+) -> PhaseEnd {
+    let exited = async {
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, process.wait())
+                .await
+                .map_or(PhaseEnd::TimedOut, PhaseEnd::Exited),
+            None => PhaseEnd::Exited(process.wait().await),
+        }
+    };
+    tokio::select! {
+        end = exited => end,
+        signal = interrupted(interrupt) => PhaseEnd::Interrupted(signal),
+    }
 }
 
 /// Spawns a phase command with the phase environment applied and both pipes draining
@@ -1465,19 +1543,28 @@ async fn run_command(
     env: &BTreeMap<String, String>,
     log_line: LogLine,
     reboot: Option<&PhaseReboot>,
+    interrupt: Option<&PhaseInterrupt>,
 ) -> Result<()> {
+    // A command the operator interrupted starts no further phase.
+    if let Some(interrupt) = interrupt {
+        interrupt.check(phase)?;
+    }
     let mut process = spawn_phase(phase, &command.value, work_dir, env, log_line, reboot)?;
-    let status = if let Some(timeout) = command.timeout {
-        if let Ok(status) = tokio::time::timeout(timeout, process.wait()).await {
-            status
-        } else {
+    let status = match wait_phase(&mut process, command.timeout, interrupt).await {
+        PhaseEnd::Exited(status) => status,
+        PhaseEnd::TimedOut => {
             process.kill().await;
             // Killing closes the pipes; let the drains flush what was buffered.
             process.flush().await;
             return Err(CliError::Operational(format!("{phase} phase timed out")));
         }
-    } else {
-        process.wait().await
+        PhaseEnd::Interrupted(signal) => {
+            process.interrupt().await;
+            return Err(CliError::Interrupted {
+                phase: phase.to_owned(),
+                signal,
+            });
+        }
     }
     .map_err(|err| CliError::Operational(format!("run {phase} phase: {err}")))?;
     // Ensure every buffered line reaches the log before the phase returns.
@@ -2354,7 +2441,12 @@ pub async fn run_stopped_phase(
     stop_status: StopStatus,
     exit: &ExitInfo,
     cap: Option<Duration>,
+    interrupt: Option<&PhaseInterrupt>,
 ) {
+    if interrupt.is_some_and(|interrupt| interrupt.signal().is_some()) {
+        // A command the operator interrupted starts no further phase.
+        return;
+    }
     let configured = ctx.config.stopped.as_ref();
     let command = match lifecycle_command("stopped", ctx.app, configured, ctx.work_dir) {
         Ok(Some(command)) => command,
@@ -2414,26 +2506,45 @@ pub async fn run_stopped_phase(
         );
         return;
     };
-    let ended = tokio::select! {
-        result = phase.wait() => Some(result),
-        () = tokio::time::sleep(timeout) => None,
-    };
+    let ended = wait_phase(&mut phase, Some(timeout), interrupt).await;
+    end_stopped_hook(ctx, reason, timeout, phase, ended).await;
+    discard_phase_files(env);
+}
+
+/// Reports how the stopped hook ended and lets its output finish reaching the log.
+async fn end_stopped_hook(
+    ctx: &AppContext<'_>,
+    reason: StoppedReason,
+    timeout: Duration,
+    mut phase: PhaseProcess,
+    ended: PhaseEnd,
+) {
     match ended {
-        Some(Ok(status)) if status.success() => {}
-        Some(Ok(status)) => tracing::warn!(
+        PhaseEnd::Exited(Ok(status)) if status.success() => {}
+        PhaseEnd::Exited(Ok(status)) => tracing::warn!(
             app = %ctx.app,
             instance = %ctx.instance,
             reason = %reason,
             exit_code = status.code().unwrap_or(-1),
             "stop hook failed"
         ),
-        Some(Err(_)) => tracing::warn!(
+        PhaseEnd::Exited(Err(_)) => tracing::warn!(
             app = %ctx.app,
             instance = %ctx.instance,
             reason = %reason,
             "stop hook failed"
         ),
-        None => {
+        PhaseEnd::Interrupted(_) => {
+            phase.interrupt().await;
+            tracing::warn!(
+                app = %ctx.app,
+                instance = %ctx.instance,
+                reason = %reason,
+                "stop hook interrupted by the operator"
+            );
+            return;
+        }
+        PhaseEnd::TimedOut => {
             phase.kill().await;
             tracing::warn!(
                 app = %ctx.app,
@@ -2445,7 +2556,6 @@ pub async fn run_stopped_phase(
         }
     }
     phase.flush().await;
-    discard_phase_files(env);
 }
 
 #[cfg(test)]
@@ -2673,6 +2783,7 @@ mod tests {
             no_log(),
             None,
             Some(PersistState::Present),
+            None,
         )
         .await
         .expect("install phase");
@@ -3292,6 +3403,7 @@ mod tests {
             no_log(),
             None,
             None,
+            None,
         )
         .await
         .expect("install phase");
@@ -3337,6 +3449,7 @@ mod tests {
             dir.path(),
             None,
             log,
+            None,
             None,
             None,
         )
@@ -3551,6 +3664,7 @@ mod tests {
             no_log(),
             Some(&reboot),
             None,
+            None,
         )
         .await
         .expect("install phase");
@@ -3600,6 +3714,7 @@ mod tests {
             no_log(),
             Some(&reboot),
             None,
+            None,
         )
         .await
         .expect("install phase");
@@ -3622,6 +3737,7 @@ mod tests {
             None,
             no_log(),
             Some(&reboot),
+            None,
             None,
         )
         .await
@@ -3655,6 +3771,7 @@ mod tests {
             no_log(),
             Some(&reboot),
             None,
+            None,
         )
         .await
         .expect("install phase");
@@ -3684,6 +3801,7 @@ mod tests {
             None,
             no_log(),
             Some(&reboot),
+            None,
             None,
         )
         .await
@@ -4013,7 +4131,7 @@ mod tests {
         let env = StopEnv::new(serde_json::json!({
             "install": {
                 "command": "sh -c 'sleep 600 & echo $! > sleeper.pid; wait'",
-                "timeout": "1s"
+                "timeout": "3s"
             }
         }));
         let install = run_install_phase(
@@ -4025,6 +4143,7 @@ mod tests {
             env.work.path(),
             Some(&env.resolver),
             Arc::clone(&env.log),
+            None,
             None,
             None,
         );
@@ -4043,6 +4162,88 @@ mod tests {
             sleeper.ends().await,
             "the phase's child outlived the timeout"
         );
+    }
+
+    /// The operator's interrupt ends a running phase with everything its shell
+    /// started, including the background job, which ignores `SIGINT`, and the phase
+    /// fails as interrupted rather than waiting for the job.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupted_phase_ends_with_what_its_shell_started() {
+        let env = StopEnv::new(serde_json::json!({
+            "install": {"command": "sh -c 'sleep 600 & echo $! > sleeper.pid; wait'"}
+        }));
+        let interrupt = PhaseInterrupt::new();
+        let install = run_install_phase(
+            "demo",
+            "demo-1",
+            "1.0",
+            &env.config,
+            &env.params,
+            env.work.path(),
+            Some(&env.resolver),
+            Arc::clone(&env.log),
+            None,
+            None,
+            Some(&interrupt),
+        );
+        let operator = async {
+            let sleeper = Grandchild::recorded_in(env.work.path()).await;
+            interrupt.raise(libc::SIGINT);
+            (sleeper, std::time::Instant::now())
+        };
+        let (result, (sleeper, raised)) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(30), install),
+            operator
+        );
+
+        let err = result
+            .expect("the phase returned once interrupted")
+            .expect_err("the install phase was interrupted");
+        assert!(
+            raised.elapsed() < SHUTDOWN_GRACE + Duration::from_secs(5),
+            "the interrupted phase took {:?} to return",
+            raised.elapsed()
+        );
+        assert!(
+            matches!(&err, CliError::Interrupted { phase, signal }
+                if phase == "install" && *signal == libc::SIGINT),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), crate::error::ExitCode::Interrupted);
+        assert!(
+            sleeper.ends().await,
+            "the phase's child outlived the interrupt"
+        );
+    }
+
+    /// A command the operator already interrupted starts no further phase.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupted_command_starts_no_further_phase() {
+        let env = StopEnv::new(serde_json::json!({
+            "install": {"command": "touch install-ran"}
+        }));
+        let interrupt = PhaseInterrupt::new();
+        interrupt.raise(libc::SIGTERM);
+        let err = run_install_phase(
+            "demo",
+            "demo-1",
+            "1.0",
+            &env.config,
+            &env.params,
+            env.work.path(),
+            Some(&env.resolver),
+            Arc::clone(&env.log),
+            None,
+            None,
+            Some(&interrupt),
+        )
+        .await
+        .expect_err("the install phase was refused");
+
+        assert_eq!(err.exit_code(), crate::error::ExitCode::Terminated);
+        assert!(!env.work.path().join("install-ran").exists());
     }
 
     /// A stop command that fails has said nothing that keeps the app running.
@@ -4185,6 +4386,7 @@ mod tests {
             StoppedReason::Exit,
             StopStatus::Skipped,
             &exit,
+            None,
             None,
         )
         .await;
@@ -4329,6 +4531,7 @@ mod tests {
             StopStatus::Ok,
             &ExitInfo::unknown(None, Duration::from_secs(1)),
             Some(Duration::from_secs(1)),
+            None,
         )
         .await;
         assert!(
@@ -4347,6 +4550,7 @@ mod tests {
             StoppedReason::Exit,
             StopStatus::Skipped,
             &ExitInfo::unknown(None, Duration::ZERO),
+            None,
             None,
         )
         .await;
@@ -4375,6 +4579,7 @@ mod tests {
             dir.path(),
             None,
             no_log(),
+            None,
             None,
             None,
         )
@@ -4698,6 +4903,7 @@ mod tests {
                 outcome.stop_status,
                 &outcome.exit,
                 cap,
+                None,
             )
             .await;
         }

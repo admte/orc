@@ -6,6 +6,10 @@ pub enum ExitCode {
     Auth = 3,
     NotFound = 4,
     Conflict = 5,
+    /// The operator interrupted the command with Ctrl-C (`128 + SIGINT`).
+    Interrupted = 130,
+    /// The command was asked to terminate (`128 + SIGTERM`).
+    Terminated = 143,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +24,9 @@ pub enum CliError {
     Conflict(String),
     #[error("{0}")]
     Operational(String),
+    /// The operator interrupted a running phase; `signal` is what interrupted it.
+    #[error("{phase} phase interrupted by the operator")]
+    Interrupted { phase: String, signal: i32 },
 }
 
 impl CliError {
@@ -31,8 +38,13 @@ impl CliError {
             Self::NotFound(_) => ExitCode::NotFound,
             Self::Conflict(_) => ExitCode::Conflict,
             Self::Operational(_) => ExitCode::Operational,
+            Self::Interrupted { signal, .. } if *signal == SIGTERM => ExitCode::Terminated,
+            Self::Interrupted { .. } => ExitCode::Interrupted,
         }
     }
 }
+
+/// `SIGTERM`'s number, spelled out so the exit status reads the same on every platform.
+const SIGTERM: i32 = 15;
 
 pub type Result<T> = std::result::Result<T, CliError>;

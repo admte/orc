@@ -1428,7 +1428,7 @@ mod tests {
         let command =
             CommandValue::String("sh -c 'sleep 600 & echo $! > sleeper.pid; wait'".to_owned());
         let (verdict, sleeper) = tokio::join!(
-            command_probe(&command, Duration::from_secs(1), &ctx),
+            command_probe(&command, Duration::from_secs(3), &ctx),
             Grandchild::recorded_in(dir.path())
         );
 
