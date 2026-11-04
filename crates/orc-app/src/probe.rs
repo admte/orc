@@ -432,6 +432,9 @@ async fn run_command_probe(
     // A probe's verdict is its exit status; its chatter would otherwise interleave
     // with the app's own log every tick.
     process.stdout(Stdio::null()).stderr(Stdio::null());
+    // Its own process group, so a timeout's kill reaches whatever it started.
+    #[cfg(unix)]
+    process.process_group(0);
     let mut child = process
         .spawn()
         .map_err(|err| format!("probe command failed to start: {err}"))?;
