@@ -53,6 +53,22 @@ pub(crate) fn stderr_at_warning(command: &mut Command) {
     }
 }
 
+/// Writes one line at warning priority: into the unit's journal when stderr is the
+/// unit's journal stream, to stderr itself otherwise.
+///
+/// For what the runtime itself has to say about the unit failing — the start shim that
+/// could not become the app — which would otherwise land at the unit's info priority and
+/// read as ordinary output to the runtime following the unit.
+pub(crate) fn warn(line: &str) {
+    if stderr_is_journal()
+        && let Ok(mut stream) = open_stream(&identifier(), LOG_WARNING)
+        && writeln!(stream, "{line}").is_ok()
+    {
+        return;
+    }
+    eprintln!("{line}");
+}
+
 /// Whether fd 2 is the journal stream systemd connected the unit to.
 ///
 /// systemd says which stream that is in `JOURNAL_STREAM` (`<device>:<inode>`), so an

@@ -90,7 +90,7 @@ env > "$out.env"
 "#;
 
 #[cfg(unix)]
-fn install_recorder(work_dir: &Path) {
+pub(super) fn install_recorder(work_dir: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
     let path = work_dir.join("rec.sh");
     std::fs::write(&path, RECORDER).expect("recorder");
@@ -98,7 +98,7 @@ fn install_recorder(work_dir: &Path) {
 }
 
 #[cfg(unix)]
-fn read_lines(path: &Path) -> Vec<String> {
+pub(super) fn read_lines(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
         .lines()
@@ -565,6 +565,183 @@ async fn the_shim_rebuilds_a_v2_managed_service_from_its_work_dir() {
         "no APP_ variable reaches a v2 app"
     );
     remove_param_files(work.path());
+}
+
+/// Set by [`run_shim_as_a_session_leader`] in the child it starts: the work dir the child,
+/// acting as the shim, becomes the app from.
+#[cfg(unix)]
+const SHIM_CHILD_WORK_DIR: &str = "ORC_APP_TEST_SHIM_WORK_DIR";
+
+/// The shim itself, run in a process of its own: when [`SHIM_CHILD_WORK_DIR`] is set this
+/// test process becomes the app exactly as `orc-agent app-exec` does, and nothing returns.
+/// Without it, which is every ordinary test run, there is nothing to do.
+#[cfg(unix)]
+#[test]
+fn shim_child() {
+    let Some(work_dir) = std::env::var_os(SHIM_CHILD_WORK_DIR) else {
+        return;
+    };
+    let work_dir = PathBuf::from(work_dir);
+    let stored = read_app_env(&work_dir).expect("app env");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let result = runtime.block_on(exec_app(
+        &work_dir,
+        &stored.app,
+        &stored.instance,
+        &stored.version,
+    ));
+    // Only a shim that failed gets here: one that worked is the app now.
+    let err = result.expect_err("exec_app returned without becoming the app");
+    eprintln!("shim error: {err}");
+    std::process::exit(1);
+}
+
+/// Runs the shim on `work_dir` the way a service manager starts it: in a process that
+/// leads a session of its own, since systemd and launchd both call `setsid` for a
+/// service's main process. Asserts it became the app and that the app exited cleanly.
+#[cfg(unix)]
+pub(super) async fn run_shim_as_a_session_leader(work_dir: &Path) {
+    use std::os::unix::process::CommandExt as _;
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args(["lifecycle::v2_tests::shim_child", "--exact", "--nocapture"])
+        .env(SHIM_CHILD_WORK_DIR, work_dir);
+    // SAFETY: `setsid` is async-signal-safe and touches nothing of this process.
+    #[allow(unsafe_code)]
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = tokio::task::spawn_blocking(move || child.output())
+        .await
+        .expect("join")
+        .expect("run the shim");
+    assert!(
+        output.status.success(),
+        "the shim did not become the app ({}):\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The shim becomes the app in place, so whatever the app's command asks of its process
+/// must hold for the session leader a service manager starts it as. Run through the real
+/// `exec_app` in such a process, with the github-runner's shape: a sensitive runtime token
+/// handed over as a file, a host-sourced plain param, and a packaged `./` script.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_shim_execs_a_v2_service_app_as_the_session_leader_a_manager_starts() {
+    let work = tempfile::tempdir().expect("work");
+    install_recorder(work.path());
+    let config = serde_json::json!({
+        "params": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "token": {
+                    "type": "string", "sensitive": true, "lifetime": "runtime",
+                    "x-source": {"kind": "github.runner", "params": {"url": "url"}}
+                },
+                "pool": {"type": "string", "x-source": {"kind": "pool.name"}}
+            }
+        },
+        "start": {
+            "service": "github-runner",
+            "command": ["./rec.sh", "start.args", "--url=${url}", "--token-file=${token_file}",
+                        "--pool=${pool}"]
+        }
+    });
+    std::fs::write(
+        work.path().join(crate::app::CONFIG_FILE_V2),
+        serde_json::to_vec(&config).expect("json"),
+    )
+    .expect("config");
+    let params = BTreeMap::from([
+        param("url", string("https://github.com/org/repo"), false),
+        param(
+            "token",
+            ParsedParamValue::SecretRef("sec:token".to_owned()),
+            true,
+        ),
+        param("pool", string("runners-v2"), false),
+    ]);
+    // What the agent persists when it defines the service: the params already resolved.
+    let resolved = resolved_params(&params, Some(&Secret(b"minted".to_vec())))
+        .await
+        .expect("resolve");
+    write_app_env(
+        work.path(),
+        &AppEnv {
+            app: "github-runner".to_owned(),
+            instance: "github-runner".to_owned(),
+            version: "default".to_owned(),
+            params: resolved,
+            persist_state: None,
+        },
+    )
+    .expect("app env");
+
+    run_shim_as_a_session_leader(work.path()).await;
+    let args = read_lines(&work.path().join("start.args"));
+    assert_eq!(args[0], "--url=https://github.com/org/repo");
+    assert!(args[1].starts_with("--token-file="), "{args:?}");
+    assert_eq!(args[2], "--pool=runners-v2");
+    assert_eq!(args.len(), 3, "{args:?}");
+    assert_eq!(
+        std::fs::read_to_string(work.path().join("start.args.token-file")).expect("token"),
+        "minted"
+    );
+    remove_param_files(work.path());
+}
+
+/// A phase is a child the runtime forks, so it leads a process group of its own — the
+/// group a timeout or an interrupt signals — and not the runtime's.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_spawned_phase_leads_a_process_group_of_its_own() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let work = tempfile::tempdir().expect("work");
+    let script = work.path().join("group.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho \"$$ $(ps -o pgid= -p $$ | tr -d ' ')\" > group\n",
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let config = v2(serde_json::json!({"install": {"command": ["./group.sh"]}}));
+    let _ = run_install_phase(
+        "demo",
+        "demo",
+        "1.0",
+        &config,
+        &BTreeMap::new(),
+        work.path(),
+        None,
+        no_log(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("install");
+    let recorded = std::fs::read_to_string(work.path().join("group")).expect("group");
+    let (pid, group) = recorded.trim().split_once(' ').expect("pid and group");
+    assert_eq!(pid, group, "the phase leads its group");
+    // SAFETY: `getpgrp` takes nothing, cannot fail, and only reads the caller's group.
+    #[allow(unsafe_code)]
+    let runtime_group = unsafe { libc::getpgrp() };
+    assert_ne!(
+        group,
+        runtime_group.to_string(),
+        "and the group is not the runtime's"
+    );
 }
 
 #[cfg(unix)]

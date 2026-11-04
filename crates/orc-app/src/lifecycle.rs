@@ -890,7 +890,9 @@ pub fn instance_service_name(
 /// A service manager starts this, not the app, because the app's environment has to be
 /// rebuilt at every start, including restarts the manager performs independently of the
 /// initiating runtime. On Unix the start command is `exec`ed, so the unit's main
-/// pid is the app itself and nothing sits between it and the manager's signals.
+/// pid is the app itself and nothing sits between it and the manager's signals. Only
+/// whoever forks a child puts it in a process group; the shim forks nothing, so the app
+/// keeps the session and group the manager gave it.
 #[allow(
     clippy::unused_async,
     reason = "the Windows path hands off to the SCM dispatcher and awaits nothing"
@@ -898,19 +900,15 @@ pub fn instance_service_name(
 pub async fn exec_app(work_dir: &Path, app: &str, instance: &str, version: &str) -> Result<()> {
     #[cfg(unix)]
     {
-        let start = shim_start_command(work_dir, app, instance, version).await?;
-        tracing::info!(app = %app, instance = %instance, "app start handed over");
-        let error = {
-            use std::os::unix::process::CommandExt as _;
-            let mut command = start.command;
-            // A unit hands stdout and stderr to the journal as one stream at one
-            // priority; the app's errors get a stream of their own, so the runtime
-            // following the unit can tell them apart.
-            #[cfg(target_os = "linux")]
-            crate::service::journal::stderr_at_warning(command.as_std_mut());
-            command.as_std_mut().exec()
-        };
-        Err(CliError::Operational(format!("start the app: {error}")))
+        let result = exec_start(work_dir, app, instance, version).await;
+        // Said where the runtime reads the unit's output, at a priority it reads as a
+        // failure, as the Windows host writes it to the log the runtime follows: the
+        // unit is about to fail, and this is the only line that says why.
+        #[cfg(target_os = "linux")]
+        if let Err(err) = &result {
+            crate::service::journal::warn(&format!("app could not be started: {err}"));
+        }
+        result
     }
     #[cfg(windows)]
     {
@@ -942,6 +940,25 @@ pub async fn exec_app(work_dir: &Path, app: &str, instance: &str, version: &str)
             "this platform has no service manager to run an app under".to_owned(),
         ))
     }
+}
+
+/// The Unix shim's work: rebuild the start command and `exec` it. Returns only when
+/// either fails.
+#[cfg(unix)]
+async fn exec_start(work_dir: &Path, app: &str, instance: &str, version: &str) -> Result<()> {
+    let start = shim_start_command(work_dir, app, instance, version).await?;
+    tracing::info!(app = %app, instance = %instance, "app start handed over");
+    let error = {
+        use std::os::unix::process::CommandExt as _;
+        let mut command = start.command;
+        // A unit hands stdout and stderr to the journal as one stream at one
+        // priority; the app's errors get a stream of their own, so the runtime
+        // following the unit can tell them apart.
+        #[cfg(target_os = "linux")]
+        crate::service::journal::stderr_at_warning(command.as_std_mut());
+        command.as_std_mut().exec()
+    };
+    Err(CliError::Operational(format!("start the app: {error}")))
 }
 
 /// Rebuilds the app's start command from what was persisted at install.
@@ -2029,7 +2046,12 @@ async fn wait_phase(
 /// v1: a string runs under the login shell, an argv list directly with `${VAR}`
 /// substitution from the environment. v2: an argv list only, its tokens substituted from
 /// the phase's token values and its program resolved against the app directory
-/// ([`v2::command`]). Either way the command leads its own process group on Unix.
+/// ([`v2::command`]).
+///
+/// No process group is set here. The command is either spawned, and whatever spawns it
+/// puts the child in a group of its own and signals that group, or `exec`ed by the start
+/// shim, which replaces itself and must leave groups alone: a service manager starts the
+/// shim as a session leader, and `setpgid` refuses a session leader.
 fn phase_process(
     command: &CommandValue,
     format: AppFormat,
@@ -2058,8 +2080,6 @@ fn phase_process(
             )?;
             let mut process = Command::new(&argv[0]);
             process.args(&argv[1..]);
-            #[cfg(unix)]
-            process.process_group(0);
             process
         }
     };
@@ -2081,6 +2101,10 @@ fn spawn_phase(
 ) -> Result<PhaseProcess> {
     let mut process = phase_process(command, format, work_dir, env, reboot)?;
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // The phase leads a process group of its own, so a timeout or an interrupt
+    // signals the group and reaches whatever the command started.
+    #[cfg(unix)]
+    process.process_group(0);
     let mut child = process
         .spawn()
         .map_err(|err| CliError::Operational(format!("run {phase} phase: {err}")))?;
@@ -2170,14 +2194,13 @@ async fn run_command(
 
 /// A string command, run by the user's login shell.
 ///
-/// Like every command built for an app, it leads its own process group: the shell may
-/// fork the command rather than exec it, and a stop, a grace-expiry kill or a timeout
-/// signals the group so it reaches the command whatever sits in between.
+/// Whatever spawns it puts it in a process group of its own: the shell may fork the
+/// command rather than exec it, and a stop, a grace-expiry kill or a timeout signals
+/// the group so it reaches the command whatever sits in between.
 #[cfg(unix)]
 fn shell_command(command: &str) -> Command {
     let mut process = Command::new(login_shell());
     process.arg("-l").arg("-c").arg(command);
-    process.process_group(0);
     process
 }
 
@@ -2293,10 +2316,6 @@ fn argv_command(argv: &[String], env: &BTreeMap<String, String>) -> Result<Comma
     for arg in &argv[1..] {
         process.arg(substitute_vars(arg, env)?);
     }
-    // Its own process group, like a string command's shell, so whatever the program
-    // starts is signalled along with it.
-    #[cfg(unix)]
-    process.process_group(0);
     Ok(process)
 }
 
@@ -3655,6 +3674,80 @@ mod tests {
         let path = PathBuf::from(&env.vars["TOKEN_FILE"]);
         assert_eq!(std::fs::read(&path).expect("read"), b"hunter2");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A v1 service app's shim becomes the app as the session leader a service manager
+    /// starts it as, whether its start command is a string the login shell runs or an
+    /// argv.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_shim_execs_a_v1_service_app_as_the_session_leader_a_manager_starts() {
+        use super::v2_tests::{install_recorder, read_lines, run_shim_as_a_session_leader};
+        let string =
+            serde_json::json!("./rec.sh start.args --url=\"$URL\" --token-file=\"$TOKEN_FILE\"");
+        let argv = serde_json::json!([
+            "./rec.sh",
+            "start.args",
+            "--url=${URL}",
+            "--token-file=${TOKEN_FILE}"
+        ]);
+        for command in [string, argv] {
+            let work = tempfile::tempdir().expect("work dir");
+            install_recorder(work.path());
+            let config = serde_json::json!({
+                "start": { "command": command, "service": "demo" }
+            });
+            std::fs::write(
+                work.path().join(crate::app::CONFIG_FILE),
+                serde_json::to_vec(&config).expect("json"),
+            )
+            .expect("config");
+            let params = BTreeMap::from([
+                (
+                    "url".to_owned(),
+                    ParsedParam {
+                        name: "url".to_owned(),
+                        value: ParsedParamValue::String("https://example.test".to_owned()),
+                        file_backed: false,
+                        lifetime: ParamLifetime::Startup,
+                    },
+                ),
+                (
+                    "token".to_owned(),
+                    ParsedParam {
+                        name: "token".to_owned(),
+                        value: ParsedParamValue::SecretRef("sec:token".to_owned()),
+                        file_backed: true,
+                        lifetime: ParamLifetime::Startup,
+                    },
+                ),
+            ]);
+            let resolved = resolved_params(&params, Some(&StubResolver(b"hunter2".to_vec())))
+                .await
+                .expect("resolve");
+            write_app_env(
+                work.path(),
+                &AppEnv {
+                    app: "demo".to_owned(),
+                    instance: "demo".to_owned(),
+                    version: "1.0".to_owned(),
+                    params: resolved,
+                    persist_state: None,
+                },
+            )
+            .expect("app env");
+
+            run_shim_as_a_session_leader(work.path()).await;
+            let args = read_lines(&work.path().join("start.args"));
+            assert_eq!(args[0], "--url=https://example.test", "{command}");
+            assert!(args[1].starts_with("--token-file="), "{command}: {args:?}");
+            assert_eq!(
+                std::fs::read_to_string(work.path().join("start.args.token-file")).expect("token"),
+                "hunter2",
+                "{command}"
+            );
+            remove_param_files(work.path());
+        }
     }
 
     #[cfg(unix)]
