@@ -15,7 +15,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -202,9 +202,16 @@ pub trait ServiceBackend: Send + Sync {
     /// interval is a lie about how quickly an app failure is noticed.
     fn watch(&self, name: &str) -> BoxStream<'static, ServiceStatus>;
 
-    /// The service's own output, line by line, from now on, each line with the stream
-    /// it reads as — stderr for what the app wrote there and for the manager's own word
-    /// that the service failed, so the caller can log it as loudly as a subprocess's.
+    /// The service's own output, line by line, each line with the stream it reads as —
+    /// stderr for what the app wrote there and for the manager's own word that the
+    /// service failed, so the caller can log it as loudly as a subprocess's.
+    ///
+    /// `since` is where the output starts: a moment taken just before the caller started
+    /// the service, so a start that fails within milliseconds — before a follower opened
+    /// after the start could be reading — is still heard, and nothing an earlier run
+    /// said is. `None` starts at the present, for a service the caller did not just
+    /// start, such as one it adopted. A backend whose log starts afresh with each run
+    /// may ignore it.
     ///
     /// A subprocess app writes down a pipe the runtime holds; a service writes into
     /// whatever its manager collects, so this is the only way its output reaches the
@@ -216,8 +223,13 @@ pub trait ServiceBackend: Send + Sync {
     /// itself ignores it; one that does not — the SCM discards a service's stdio — is
     /// told where the runtime's shim left its copy. It is passed per call rather than
     /// held by the backend because one backend serves every app on the host.
-    fn logs(&self, name: &str, work_dir: &Path) -> Option<BoxStream<'static, (LogStream, String)>> {
-        let _ = (name, work_dir);
+    fn logs(
+        &self,
+        name: &str,
+        work_dir: &Path,
+        since: Option<SystemTime>,
+    ) -> Option<BoxStream<'static, (LogStream, String)>> {
+        let _ = (name, work_dir, since);
         None
     }
 }

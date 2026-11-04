@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
@@ -263,32 +264,22 @@ impl ServiceBackend for Systemd {
         ))
     }
 
-    /// Follows the unit's journal from now on, one line per record, each read by
-    /// [`journal::journal_lines`] for the stream it stands for.
+    /// Follows the unit's journal from `since`, or from the present, one line per
+    /// record, each read by [`journal::journal_lines`] for the stream it stands for.
     ///
-    /// `--lines 0` starts at the present: the runtime is adopting or starting the app
-    /// here, and replaying the last boot's output into the node log would date-stamp
-    /// old failures as if they had just happened. JSON rather than bare messages,
-    /// because the priority is what tells a traceback from a progress line.
+    /// Never from further back: replaying an earlier run's output into the node log
+    /// would date-stamp old failures as if they had just happened. JSON rather than bare
+    /// messages, because the priority is what tells a traceback from a progress line.
     fn logs(
         &self,
         name: &str,
         _work_dir: &Path,
+        since: Option<SystemTime>,
     ) -> Option<BoxStream<'static, (LogStream, String)>> {
         // The journal already holds the unit's output; where the app's files sit is
         // beside the point.
         let mut child = Command::new("journalctl")
-            .args([
-                "--unit",
-                name,
-                "--follow",
-                "--lines",
-                "0",
-                "--output",
-                "json",
-                "--output-fields",
-                journal::FIELDS,
-            ])
+            .args(follow_args(name, since))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -586,6 +577,28 @@ fn operational(what: &str, err: impl std::fmt::Display) -> CliError {
     CliError::Operational(format!("{what}: {err}"))
 }
 
+/// `journalctl` arguments that follow a unit's journal from `since`, to the
+/// microsecond, or from the present when there is none.
+fn follow_args(name: &str, since: Option<SystemTime>) -> Vec<String> {
+    let start = match since {
+        Some(since) => {
+            let at = since.duration_since(UNIX_EPOCH).unwrap_or_default();
+            [
+                "--since".to_owned(),
+                format!("@{}.{:06}", at.as_secs(), at.subsec_micros()),
+                "--lines".to_owned(),
+                "all".to_owned(),
+            ]
+            .to_vec()
+        }
+        None => ["--lines".to_owned(), "0".to_owned()].to_vec(),
+    };
+    let mut args = vec!["--unit".to_owned(), name.to_owned(), "--follow".to_owned()];
+    args.extend(start);
+    args.extend(["--output", "json", "--output-fields", journal::FIELDS].map(str::to_owned));
+    args
+}
+
 #[cfg(test)]
 mod kill_order_tests {
     use super::{kill_argv, start_argv};
@@ -627,5 +640,43 @@ mod kill_order_tests {
             ],
             "the stop job must be queued before the kill"
         );
+    }
+}
+
+#[cfg(test)]
+mod follow_tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::follow_args;
+
+    /// A service the runtime just started is followed from the moment before its
+    /// start, to the microsecond, with no cap on how many lines that is.
+    #[test]
+    fn a_started_service_is_followed_from_just_before_its_start() {
+        let since = UNIX_EPOCH + Duration::from_micros(1_793_762_626_755_039);
+        let args = follow_args("demo.service", Some(since));
+        assert_eq!(
+            &args[..7],
+            [
+                "--unit",
+                "demo.service",
+                "--follow",
+                "--since",
+                "@1793762626.755039",
+                "--lines",
+                "all"
+            ]
+        );
+    }
+
+    /// One it did not just start is followed from the present.
+    #[test]
+    fn an_adopted_service_is_followed_from_now() {
+        let args = follow_args("demo.service", None);
+        assert_eq!(
+            &args[..5],
+            ["--unit", "demo.service", "--follow", "--lines", "0"]
+        );
+        assert!(!args.iter().any(|arg| arg == "--since"), "{args:?}");
     }
 }
