@@ -16,7 +16,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -299,8 +299,14 @@ impl ServiceBackend for Scm {
     }
 
     /// The shim's copy holds stdout and stderr as one stream, so every line reads as
-    /// stdout.
-    fn logs(&self, name: &str, work_dir: &Path) -> Option<BoxStream<'static, (LogStream, String)>> {
+    /// stdout. The shim starts the copy afresh with each run and it is followed from its
+    /// first line, so `since` is already what it holds.
+    fn logs(
+        &self,
+        name: &str,
+        work_dir: &Path,
+        _since: Option<SystemTime>,
+    ) -> Option<BoxStream<'static, (LogStream, String)>> {
         let path = log_path(work_dir);
         let name = name.to_owned();
         let (sender, receiver) = tokio::sync::mpsc::channel(LOG_BUFFER);
