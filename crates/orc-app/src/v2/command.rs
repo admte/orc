@@ -16,9 +16,13 @@
 //! PowerShell 5.1 binds each `-Name:value` element after the script path to the script's
 //! `param()` block with the value intact — spaces, commas, a leading `-`, `$env:X`, single
 //! and double quotes, and a trailing backslash all arrive as written. The one exception is
-//! an **empty** value: `-Name:` leaves the parameter unbound, so the script sees its
-//! declared default (or `$null`, which a `[string]` reads as `""`). A manifest that must
-//! tell "set to empty" from "not given" on Windows cannot do it with `-Name:${x:-}`.
+//! an **empty** value: a trailing `-Name:` leaves the parameter unbound, but one followed by
+//! another element takes that element as its value. So on Windows an element that is
+//! `-Name:` followed only by tokens (`-Dir:${dir}`) is dropped when they resolve to the
+//! empty string, the same as when one names an unset value: the script sees its declared
+//! default wherever the element stood. An element with text beside its tokens
+//! (`-Dir:a${x}`) is kept, since its value is not empty. Unix keeps `--name=` with an
+//! empty value: there it is a value like any other.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -86,8 +90,39 @@ pub fn command_argv(
     };
     stays_in_app_dir(&template[0], &program)?;
     let mut argv = vec![program];
-    argv.extend(elements.flatten());
+    argv.extend(
+        elements
+            .zip(&template[1..])
+            .filter_map(|(element, written)| {
+                element.filter(|value| {
+                    host != CommandHost::Windows || !is_empty_powershell_flag(written, value)
+                })
+            }),
+    );
     Ok(resolve_program(argv, app_dir, host))
+}
+
+/// Whether `written`, resolved to `value`, is a PowerShell `-Name:` flag its tokens left
+/// empty: the element as written is `-Name:` followed by tokens and nothing else, and
+/// `value` is that `-Name:` alone. PowerShell would bind an empty `-Name:` to the element
+/// after it (module docs), so such an element is dropped.
+fn is_empty_powershell_flag(written: &str, value: &str) -> bool {
+    let Ok(pieces) = token::parse(written) else {
+        return false;
+    };
+    let Some((token::Piece::Text { text, .. }, rest)) = pieces.split_first() else {
+        return false;
+    };
+    let is_flag = text
+        .strip_prefix('-')
+        .and_then(|rest| rest.strip_suffix(':'))
+        .is_some_and(token::is_name);
+    is_flag
+        && !rest.is_empty()
+        && rest
+            .iter()
+            .all(|piece| matches!(piece, token::Piece::Token(_)))
+        && value == *text
 }
 
 /// Refuses a `./` (or `.\`) program whose substituted path leaves the app directory:
@@ -330,5 +365,67 @@ mod tests {
         .expect_err("no program");
         assert!(err.to_string().contains("not set"), "{err}");
         assert!(command_argv(&[], &tokens, Path::new("/"), CommandHost::Unix).is_err());
+    }
+
+    /// On Windows an element that is `-Name:` and one token is dropped when the token
+    /// resolves to the empty string, as an unset one is: PowerShell would otherwise bind
+    /// the next element as its value. Unix keeps `--name=` with an empty value.
+    #[test]
+    fn an_empty_powershell_flag_is_dropped_on_windows_only() {
+        let tokens = BTreeMap::from([
+            ("dir".to_owned(), String::new()),
+            ("cmd_file".to_owned(), "C:\\p\\cmd".to_owned()),
+            ("label".to_owned(), "x".to_owned()),
+        ]);
+        let run = |template: &[&str], host| {
+            command_argv(&argv(template), &tokens, Path::new("/srv/app"), host).expect("argv")
+        };
+        // Empty: dropped, wherever it stands. Non-empty: kept. Unset: dropped as before.
+        assert_eq!(
+            run(
+                &[
+                    "tool",
+                    "-Dir:${dir}",
+                    "-CmdFile:${cmd_file}",
+                    "-Pool:${pool}"
+                ],
+                CommandHost::Windows
+            ),
+            argv(&["tool", "-CmdFile:C:\\p\\cmd"])
+        );
+        // A `:-` default that resolves to the empty string is empty too.
+        assert_eq!(
+            run(
+                &["tool", "-Pool:${pool:-}", "-Label:${label}"],
+                CommandHost::Windows
+            ),
+            argv(&["tool", "-Label:x"])
+        );
+        // Only an element that is `-Name:` and tokens alone, all of them empty: text beside
+        // a token makes the value non-empty, or the element no PowerShell flag, and it
+        // stays.
+        assert_eq!(
+            run(
+                &[
+                    "tool",
+                    "-Dir:a${dir}",
+                    "-Dir:${dir}b",
+                    "-Dir:${dir}${dir}",
+                    "/Dir:${dir}",
+                    "--dir=${dir}",
+                    "${dir}"
+                ],
+                CommandHost::Windows
+            ),
+            argv(&["tool", "-Dir:a", "-Dir:b", "/Dir:", "--dir=", ""])
+        );
+        // Unix: an empty value is a value; only an unset one drops its element.
+        assert_eq!(
+            run(
+                &["tool", "--dir=${dir}", "-Dir:${dir}", "--pool=${pool}"],
+                CommandHost::Unix
+            ),
+            argv(&["tool", "--dir=", "-Dir:"])
+        );
     }
 }
