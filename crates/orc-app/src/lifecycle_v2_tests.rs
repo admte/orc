@@ -1092,3 +1092,38 @@ async fn powershell_file_binds_name_colon_value_elements() {
             .join("\n")
     );
 }
+
+/// An empty param named as `-Name:${param}` ahead of another element: written out, the
+/// empty `-Value:` would take `-Out:…` as its value. The runtime drops the element, so the
+/// script sees its declared default and `-Out` binds as written.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_empty_powershell_flag_is_dropped_before_it_can_take_the_next_element() {
+    let work = tempfile::tempdir().expect("work");
+    std::fs::write(work.path().join("rec.ps1"), PS_RECORDER).expect("script");
+    let config = v2(serde_json::json!({
+        "params": {"type": "object", "properties": {"value": {"type": "string"}}},
+        "install": {"command": ["rec.ps1", "-Value:${value}", "-Out:empty.json"], "timeout": "60s"}
+    }));
+    let params = BTreeMap::from([param("value", string(""), false)]);
+    let log: LogLine = Arc::new(|_, _: &str| {});
+    let _ = run_install_phase(
+        "demo",
+        "demo",
+        "1.0",
+        &config,
+        &params,
+        work.path(),
+        None,
+        log,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("install");
+    let body = std::fs::read_to_string(work.path().join("empty.json")).expect("output");
+    let parsed: serde_json::Value =
+        serde_json::from_str(body.trim_start_matches('\u{feff}').trim()).expect("json");
+    assert_eq!(parsed["Value"], "<unbound>", "{parsed}");
+}
