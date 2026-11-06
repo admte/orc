@@ -17,12 +17,20 @@
 //! `param()` block with the value intact — spaces, commas, a leading `-`, `$env:X`, single
 //! and double quotes, and a trailing backslash all arrive as written. The one exception is
 //! an **empty** value: a trailing `-Name:` leaves the parameter unbound, but one followed by
-//! another element takes that element as its value. So on Windows an element that is
-//! `-Name:` followed only by tokens (`-Dir:${dir}`) is dropped when they resolve to the
-//! empty string, the same as when one names an unset value: the script sees its declared
-//! default wherever the element stood. An element with text beside its tokens
-//! (`-Dir:a${x}`) is kept, since its value is not empty. Unix keeps `--name=` with an
-//! empty value: there it is a value like any other.
+//! another element takes that element as its value. So when PowerShell runs a script file,
+//! an element after the script path that is `-Name:` followed only by tokens (`-Dir:${dir}`)
+//! is dropped when they resolve to the empty string, the same as when one names an unset
+//! value: the script sees its declared default wherever the element stood. An element with
+//! text beside its tokens (`-Dir:a${x}`) is kept, since its value is not empty.
+//!
+//! PowerShell runs a script file when the first element names a packaged `.ps1` (the
+//! `-File` form above), or when the program is `powershell` or `pwsh` spelled out (by name
+//! or path, with or without `.exe`) and its arguments carry `-File <script>` before any
+//! `-Command`. Only the elements after the script path are the script's parameters; the
+//! ones before it are PowerShell's own. Every other program — a packaged `.exe`, `cmd.exe`,
+//! any program looked up in `PATH`, `pwsh -Command …` — receives a `-Name:` element as
+//! written, empty or not, and so does every Unix program: there `--name=` with an empty
+//! value is a value like any other.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -76,10 +84,9 @@ pub fn command_argv(
             "lifecycle command argv cannot be empty".to_owned(),
         ));
     }
-    let substituted = token::substitute_argv(template, tokens)
+    let mut substituted = token::substitute_argv(template, tokens)
         .map_err(|err| CliError::Operational(format!("lifecycle command: {err}")))?;
-    let mut elements = substituted.into_iter();
-    let Some(program) = elements.next().flatten() else {
+    let Some(program) = substituted.first_mut().and_then(Option::take) else {
         let token = token::first_unset(&template[0], |name| tokens.get(name).map(String::as_str))
             .unwrap_or_default();
         return Err(CliError::Operational(format!(
@@ -89,17 +96,90 @@ pub fn command_argv(
         )));
     };
     stays_in_app_dir(&template[0], &program)?;
+    // The Windows program is classified once, and that one answer both decides which
+    // elements are a script's parameters and resolves the program, so the two cannot
+    // disagree.
+    let windows = (host == CommandHost::Windows).then(|| classify_windows(&program, app_dir));
+    let script_params = windows
+        .as_ref()
+        .and_then(|class| script_params_start(class, &program, &substituted[1..]));
     let mut argv = vec![program];
-    argv.extend(
-        elements
-            .zip(&template[1..])
-            .filter_map(|(element, written)| {
-                element.filter(|value| {
-                    host != CommandHost::Windows || !is_empty_powershell_flag(written, value)
-                })
-            }),
-    );
-    Ok(resolve_program(argv, app_dir, host))
+    for (index, (element, written)) in substituted.into_iter().zip(template).enumerate().skip(1) {
+        let Some(value) = element else {
+            continue;
+        };
+        if script_params.is_some_and(|start| index >= start)
+            && is_empty_powershell_flag(written, &value)
+        {
+            continue;
+        }
+        argv.push(value);
+    }
+    Ok(match windows {
+        Some(class) => resolve_windows(argv, class),
+        None => resolve_program(argv, app_dir, host),
+    })
+}
+
+/// Where a Windows program's script parameters start, as an index into the command
+/// (the program is index 0), when PowerShell runs a script file: right after the
+/// program for a packaged `.ps1`, or after `-File <script>` for `powershell` or `pwsh`
+/// spelled out. `None` for every other program, and for PowerShell running anything
+/// but a file. `rest` is the substituted command after the program; an unset element
+/// (`None`) is not there to be a switch or the script.
+fn script_params_start(
+    class: &WindowsProgram,
+    program: &str,
+    rest: &[Option<String>],
+) -> Option<usize> {
+    if matches!(class, WindowsProgram::PackagedScript(_)) {
+        return Some(1);
+    }
+    if !is_powershell(program) {
+        return None;
+    }
+    let mut present = rest
+        .iter()
+        .enumerate()
+        .filter_map(|(index, element)| element.as_deref().map(|value| (index + 1, value)));
+    while let Some((_, element)) = present.next() {
+        if powershell_switch(element, "file", "f") {
+            // The script is the next element there is; its parameters follow it.
+            return present.next().map(|(script, _)| script + 1);
+        }
+        if powershell_switch(element, "command", "c")
+            || powershell_switch(element, "encodedcommand", "e")
+            || powershell_switch(element, "ec", "ec")
+        {
+            // Everything after `-Command` is the command, never a script's parameters.
+            return None;
+        }
+    }
+    None
+}
+
+/// Whether `program` names Windows PowerShell or PowerShell 7: its file name, whatever
+/// the directory, is `powershell` or `pwsh`, with or without `.exe`, in any case.
+fn is_powershell(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    stem == "powershell" || stem == "pwsh"
+}
+
+/// Whether `element` is PowerShell's own `-name` switch, as both `powershell.exe` and
+/// `pwsh` match one: a leading `-`, `--` or `/`, then any prefix of `name` at least as
+/// long as `shortest`, in any case.
+fn powershell_switch(element: &str, name: &str, shortest: &str) -> bool {
+    let Some(spelled) = element
+        .strip_prefix("--")
+        .or_else(|| element.strip_prefix('-'))
+        .or_else(|| element.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let spelled = spelled.to_ascii_lowercase();
+    spelled.starts_with(shortest) && name.starts_with(&spelled)
 }
 
 /// Whether `written`, resolved to `value`, is a PowerShell `-Name:` flag its tokens left
@@ -173,31 +253,62 @@ pub fn resolve_program(mut argv: Vec<String>, app_dir: &Path, host: CommandHost)
             }
             argv
         }
-        CommandHost::Windows => {
-            let (explicit, name) = first
-                .strip_prefix("./")
-                .or_else(|| first.strip_prefix(".\\"))
-                .map_or((false, first.as_str()), |name| (true, name));
-            let local = windows_join(app_dir, name);
-            let extension = Path::new(name)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or_default();
-            let packaged = Path::new(&local).is_file();
-            if extension.eq_ignore_ascii_case("ps1") && packaged {
-                let mut out: Vec<String> = POWERSHELL_FILE
-                    .iter()
-                    .map(|part| (*part).to_owned())
-                    .collect();
-                out.push(local);
-                out.extend(argv.into_iter().skip(1));
-                return out;
-            }
-            if (extension.eq_ignore_ascii_case("exe") && packaged) || explicit {
-                argv[0] = local;
+        CommandHost::Windows => resolve_windows(argv, classify_windows(&first, app_dir)),
+    }
+}
+
+/// What a Windows command's first element names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowsProgram {
+    /// A packaged `.ps1`, by its path in the app directory: it runs under
+    /// [`POWERSHELL_FILE`].
+    PackagedScript(String),
+    /// A packaged `.exe`, or any `./` (`.\`) name, by its path in the app directory.
+    Local(String),
+    /// Anything else, run as written and so looked up in `PATH`.
+    Path,
+}
+
+/// Classifies a Windows command's (substituted) first element against `app_dir`.
+fn classify_windows(first: &str, app_dir: &Path) -> WindowsProgram {
+    let (explicit, name) = first
+        .strip_prefix("./")
+        .or_else(|| first.strip_prefix(".\\"))
+        .map_or((false, first), |name| (true, name));
+    let local = windows_join(app_dir, name);
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let packaged = Path::new(&local).is_file();
+    if extension.eq_ignore_ascii_case("ps1") && packaged {
+        WindowsProgram::PackagedScript(local)
+    } else if (extension.eq_ignore_ascii_case("exe") && packaged) || explicit {
+        WindowsProgram::Local(local)
+    } else {
+        WindowsProgram::Path
+    }
+}
+
+/// Resolves a Windows argv whose first element was classified as `class`.
+fn resolve_windows(mut argv: Vec<String>, class: WindowsProgram) -> Vec<String> {
+    match class {
+        WindowsProgram::PackagedScript(script) => {
+            let mut out: Vec<String> = POWERSHELL_FILE
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect();
+            out.push(script);
+            out.extend(argv.into_iter().skip(1));
+            out
+        }
+        WindowsProgram::Local(local) => {
+            if let Some(first) = argv.first_mut() {
+                *first = local;
             }
             argv
         }
+        WindowsProgram::Path => argv,
     }
 }
 
@@ -367,65 +478,190 @@ mod tests {
         assert!(command_argv(&[], &tokens, Path::new("/"), CommandHost::Unix).is_err());
     }
 
-    /// On Windows an element that is `-Name:` and one token is dropped when the token
-    /// resolves to the empty string, as an unset one is: PowerShell would otherwise bind
-    /// the next element as its value. Unix keeps `--name=` with an empty value.
-    #[test]
-    fn an_empty_powershell_flag_is_dropped_on_windows_only() {
+    /// The tokens and the app directory the empty-flag tests run against: `dir` is set
+    /// but empty, `pool` is unset. The directory packages `start.ps1` and `tool.exe`.
+    fn empty_flag_fixture() -> (tempfile::TempDir, BTreeMap<String, String>) {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("start.ps1"), "param()").expect("script");
+        std::fs::write(dir.path().join("tool.exe"), "MZ").expect("exe");
         let tokens = BTreeMap::from([
             ("dir".to_owned(), String::new()),
             ("cmd_file".to_owned(), "C:\\p\\cmd".to_owned()),
             ("label".to_owned(), "x".to_owned()),
         ]);
-        let run = |template: &[&str], host| {
-            command_argv(&argv(template), &tokens, Path::new("/srv/app"), host).expect("argv")
+        (dir, tokens)
+    }
+
+    /// What follows the program (or, for a packaged script, the script path).
+    fn args_after(argv: &[String], skip: usize) -> Vec<String> {
+        argv[skip..].to_vec()
+    }
+
+    /// A packaged `.ps1` runs under `powershell -File`, where an empty `-Name:` would
+    /// bind the next element as its value: an element that is `-Name:` and tokens alone,
+    /// all of them empty, is dropped like an unset one.
+    #[test]
+    fn an_empty_powershell_flag_is_dropped_for_a_packaged_script() {
+        let (dir, tokens) = empty_flag_fixture();
+        let run = |template: &[&str]| {
+            let argv = command_argv(&argv(template), &tokens, dir.path(), CommandHost::Windows)
+                .expect("argv");
+            assert_eq!(argv[0], "powershell", "{argv:?}");
+            args_after(&argv, POWERSHELL_FILE.len() + 1)
         };
         // Empty: dropped, wherever it stands. Non-empty: kept. Unset: dropped as before.
         assert_eq!(
-            run(
-                &[
-                    "tool",
-                    "-Dir:${dir}",
-                    "-CmdFile:${cmd_file}",
-                    "-Pool:${pool}"
-                ],
-                CommandHost::Windows
-            ),
-            argv(&["tool", "-CmdFile:C:\\p\\cmd"])
+            run(&[
+                "start.ps1",
+                "-Dir:${dir}",
+                "-CmdFile:${cmd_file}",
+                "-Pool:${pool}"
+            ]),
+            argv(&["-CmdFile:C:\\p\\cmd"])
         );
-        // A `:-` default that resolves to the empty string is empty too.
+        // A `:-` default that resolves to the empty string is empty too, and the `./`
+        // spelling names the same packaged script.
         assert_eq!(
-            run(
-                &["tool", "-Pool:${pool:-}", "-Label:${label}"],
-                CommandHost::Windows
-            ),
-            argv(&["tool", "-Label:x"])
+            run(&["./start.ps1", "-Pool:${pool:-}", "-Label:${label}"]),
+            argv(&["-Label:x"])
         );
         // Only an element that is `-Name:` and tokens alone, all of them empty: text beside
         // a token makes the value non-empty, or the element no PowerShell flag, and it
         // stays.
         assert_eq!(
-            run(
-                &[
-                    "tool",
-                    "-Dir:a${dir}",
-                    "-Dir:${dir}b",
-                    "-Dir:${dir}${dir}",
-                    "/Dir:${dir}",
-                    "--dir=${dir}",
-                    "${dir}"
-                ],
-                CommandHost::Windows
-            ),
-            argv(&["tool", "-Dir:a", "-Dir:b", "/Dir:", "--dir=", ""])
+            run(&[
+                "start.ps1",
+                "-Dir:a${dir}",
+                "-Dir:${dir}b",
+                "-Dir:${dir}${dir}",
+                "/Dir:${dir}",
+                "--dir=${dir}",
+                "${dir}"
+            ]),
+            argv(&["-Dir:a", "-Dir:b", "/Dir:", "--dir=", ""])
+        );
+    }
+
+    /// `powershell` or `pwsh` spelled out runs a script file with `-File <script>`: the
+    /// elements after the script are its parameters and drop when empty; the ones before
+    /// it are PowerShell's own and stay as written.
+    #[test]
+    fn an_empty_powershell_flag_is_dropped_after_an_explicit_file() {
+        let (dir, tokens) = empty_flag_fixture();
+        let run = |template: &[&str]| {
+            command_argv(&argv(template), &tokens, dir.path(), CommandHost::Windows).expect("argv")
+        };
+        assert_eq!(
+            run(&[
+                "powershell",
+                "-NoProfile",
+                "-File",
+                "x.ps1",
+                "-Dir:${dir}",
+                "-Label:${label}"
+            ]),
+            argv(&["powershell", "-NoProfile", "-File", "x.ps1", "-Label:x"])
+        );
+        // By path, with `.exe`, in any case; `-f` and `-file` are `-File` too.
+        for program in [
+            "pwsh",
+            "PWSH.EXE",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            "C:/Windows/System32/WindowsPowerShell/v1.0/PowerShell.exe",
+        ] {
+            for file in ["-File", "-f", "-file", "--file", "/File"] {
+                assert_eq!(
+                    run(&[program, file, "x.ps1", "-Dir:${dir}"]),
+                    argv(&[program, file, "x.ps1"]),
+                    "{program} {file}"
+                );
+            }
+        }
+        // An element before the script is not the script's: it stays as written.
+        assert_eq!(
+            run(&["pwsh", "-Dir:${dir}", "-File", "x.ps1", "-Dir:${dir}"]),
+            argv(&["pwsh", "-Dir:", "-File", "x.ps1"])
+        );
+        // An unset element between `-File` and the script is not the script.
+        assert_eq!(
+            run(&["pwsh", "-File", "${pool}", "x.ps1", "-Dir:${dir}"]),
+            argv(&["pwsh", "-File", "x.ps1"])
+        );
+    }
+
+    /// Every other program receives a `-Name:` element as written, empty or not: a
+    /// packaged `.exe`, `cmd.exe` or any program looked up in `PATH`, PowerShell running
+    /// a command rather than a file, and every program on Unix.
+    #[test]
+    fn an_empty_flag_is_kept_for_any_other_program() {
+        let (dir, tokens) = empty_flag_fixture();
+        let template =
+            |program: &str| argv(&[program, "-Dir:${dir}", "-Label:${label}", "-Pool:${pool}"]);
+        let run = |template: &[String], host| {
+            command_argv(template, &tokens, dir.path(), host).expect("argv")
+        };
+        // A packaged .exe, by its path in the app directory.
+        assert_eq!(
+            run(&template("tool.exe"), CommandHost::Windows),
+            argv(&[&windows_join(dir.path(), "tool.exe"), "-Dir:", "-Label:x"])
+        );
+        // PATH programs, including a script that is not packaged.
+        for program in ["tool", "cmd.exe", "other.ps1", "powershell-helper.exe"] {
+            assert_eq!(
+                run(&template(program), CommandHost::Windows),
+                argv(&[program, "-Dir:", "-Label:x"]),
+                "{program}"
+            );
+        }
+        // PowerShell running a command: the rest is the command, `-File` in it included.
+        for switch in ["-Command", "-c", "-EncodedCommand", "-ec"] {
+            assert_eq!(
+                run(
+                    &argv(&[
+                        "pwsh",
+                        switch,
+                        "& ./x.ps1",
+                        "-Dir:${dir}",
+                        "-File",
+                        "y.ps1",
+                        "-Dir:${dir}"
+                    ]),
+                    CommandHost::Windows
+                ),
+                argv(&[
+                    "pwsh",
+                    switch,
+                    "& ./x.ps1",
+                    "-Dir:",
+                    "-File",
+                    "y.ps1",
+                    "-Dir:"
+                ]),
+                "{switch}"
+            );
+        }
+        // PowerShell with neither: nothing is a script's parameter.
+        assert_eq!(
+            run(&template("powershell"), CommandHost::Windows),
+            argv(&["powershell", "-Dir:", "-Label:x"])
         );
         // Unix: an empty value is a value; only an unset one drops its element.
         assert_eq!(
             run(
-                &["tool", "--dir=${dir}", "-Dir:${dir}", "--pool=${pool}"],
+                &argv(&["tool", "--dir=${dir}", "-Dir:${dir}", "--pool=${pool}"]),
                 CommandHost::Unix
             ),
             argv(&["tool", "--dir=", "-Dir:"])
         );
+        for program in ["./start.ps1", "pwsh"] {
+            assert_eq!(
+                run(
+                    &argv(&[program, "-File", "x.ps1", "-Dir:${dir}"]),
+                    CommandHost::Unix
+                )[1..],
+                argv(&["-File", "x.ps1", "-Dir:"]),
+                "{program}"
+            );
+        }
     }
 }
