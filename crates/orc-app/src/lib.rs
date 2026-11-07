@@ -4,6 +4,7 @@ pub mod app;
 pub mod cache;
 pub mod certs;
 pub mod chunked;
+pub mod console;
 pub mod credential;
 pub mod discovery;
 pub mod encryption;

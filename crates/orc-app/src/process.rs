@@ -88,7 +88,7 @@ pub enum StopAsk {
     Signal(StopSignal),
     /// The service manager was asked to stop the app; it delivers its own signal.
     Manager,
-    /// Nothing could be asked; the grace period is the whole of the app's chance.
+    /// Nothing could be asked; the wait is the whole of the app's chance.
     None,
 }
 

@@ -221,7 +221,7 @@ impl ServiceBackend for Systemd {
     }
 
     async fn stop(&self, name: &str) -> Result<()> {
-        // `--no-block`: the grace period and the kill behind it belong to the
+        // `--no-block`: the wait and the kill behind it belong to the
         // termination sequence, and it cannot run them while parked inside systemctl.
         systemctl(&["stop", "--no-block", name]).await?;
         tracing::info!(service = %name, "service stop requested");

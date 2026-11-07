@@ -159,7 +159,8 @@ pub struct ServiceSpec {
     pub restart: RestartPolicy,
     /// The signal the manager delivers to ask the app to end (`stop.signal`).
     pub kill_signal: StopSignal,
-    /// How long the manager waits for the app to end before killing it (`stop.grace`).
+    /// How long the manager waits for the app to end before killing it: the app's
+    /// [`crate::lifecycle::stop_window`].
     pub stop_timeout: Duration,
 }
 
@@ -186,7 +187,7 @@ pub trait ServiceBackend: Send + Sync {
     async fn start(&self, name: &str) -> Result<()>;
 
     /// Asks the manager to stop the service, and returns without waiting for it to
-    /// land. The grace period and the kill behind it belong to the termination
+    /// land. The wait and the kill behind it belong to the termination
     /// sequence, which cannot run them while blocked inside this call.
     async fn stop(&self, name: &str) -> Result<()>;
 
