@@ -583,14 +583,19 @@ pub fn drain_lines(
         loop {
             match reader.read_until(b'\n', &mut partial).await {
                 Ok(0) => {
-                    if !partial.is_empty() {
-                        log(stream, &String::from_utf8_lossy(trim_line(&partial)));
+                    // A stream that ended on a line break has nothing left over.
+                    if !partial.is_empty()
+                        && let Some(line) = output_line(&partial)
+                    {
+                        log(stream, &line);
                     }
                     break;
                 }
                 Ok(_) => {
                     if partial.ends_with(b"\n") {
-                        log(stream, &String::from_utf8_lossy(trim_line(&partial)));
+                        if let Some(line) = output_line(&partial) {
+                            log(stream, &line);
+                        }
                         partial.clear();
                     }
                 }
@@ -598,6 +603,111 @@ pub fn drain_lines(
             }
         }
     })
+}
+
+/// One line of an app's output as the log shows it, or `None` when it shows nothing.
+///
+/// The line breaks are trimmed, carriage returns included. Output that is valid UTF-8
+/// is UTF-8. On Windows anything else is text in the console's code page — what a
+/// .NET or C program writes there when its output is a pipe, `√` included — and a
+/// blank line, which a Windows program prints between paragraphs as a bare `\r\n`, is
+/// dropped. Elsewhere invalid bytes read as replacement characters and every line is
+/// kept, as before.
+fn output_line(raw: &[u8]) -> Option<String> {
+    decode_line(raw, cfg!(windows), legacy_text)
+}
+
+/// [`output_line`] with the platform's choices passed in: whether blank lines are
+/// dropped, and how bytes that are not UTF-8 are read.
+fn decode_line(
+    raw: &[u8],
+    drop_blank: bool,
+    legacy: impl FnOnce(&[u8]) -> Option<String>,
+) -> Option<String> {
+    let line = trim_line(raw);
+    let text = match std::str::from_utf8(line) {
+        Ok(text) => text.to_owned(),
+        Err(_) => legacy(line).unwrap_or_else(|| String::from_utf8_lossy(line).into_owned()),
+    };
+    if drop_blank && text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// Reads bytes in the console's output code page, or the system's OEM code page when
+/// this process has no console — the one a console program falls back to.
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "code page conversion has no safe API")]
+fn legacy_text(bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::GetOEMCP;
+    use windows_sys::Win32::System::Console::GetConsoleOutputCP;
+
+    // SAFETY: no arguments.
+    let (console, oem) = unsafe { (GetConsoleOutputCP(), GetOEMCP()) };
+    code_page_text(legacy_code_page(console, oem)?, bytes)
+}
+
+/// The code page that bytes which are not UTF-8 were written in: the console's, or the
+/// OEM one when there is no console (0) or the console is UTF-8 — the bytes are no
+/// UTF-8, so whatever wrote them did not use it. `None` when no legacy code page is
+/// left to try.
+#[cfg_attr(not(windows), allow(dead_code, reason = "only Windows has code pages"))]
+fn legacy_code_page(console: u32, oem: u32) -> Option<u32> {
+    const UTF8: u32 = 65001;
+    [console, oem]
+        .into_iter()
+        .find(|code_page| *code_page != 0 && *code_page != UTF8)
+}
+
+/// Decodes `bytes` from the Windows code page `code_page`.
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "code page conversion has no safe API")]
+fn code_page_text(code_page: u32, bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::MultiByteToWideChar;
+
+    let length = i32::try_from(bytes.len()).ok()?;
+    if length == 0 {
+        return Some(String::new());
+    }
+    // SAFETY: `bytes` is valid for `length` bytes; a null output asks for the size.
+    let wide = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let mut buffer = vec![0_u16; usize::try_from(wide).ok().filter(|wide| *wide > 0)?];
+    // SAFETY: `buffer` holds exactly the `wide` units the first call asked for.
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            length,
+            buffer.as_mut_ptr(),
+            wide,
+        )
+    };
+    buffer.truncate(
+        usize::try_from(written)
+            .ok()
+            .filter(|written| *written > 0)?,
+    );
+    String::from_utf16(&buffer).ok()
+}
+
+#[cfg(not(windows))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Windows reads another code page here; other platforms have none to read"
+)]
+fn legacy_text(_bytes: &[u8]) -> Option<String> {
+    None
 }
 
 fn trim_line(line: &[u8]) -> &[u8] {
@@ -610,6 +720,81 @@ fn trim_line(line: &[u8]) -> &[u8] {
         }
     }
     line
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn a_utf8_line_reads_as_written_without_its_line_break() {
+        let never = |_: &[u8]| -> Option<String> { panic!("UTF-8 needs no other reading") };
+        assert_eq!(
+            decode_line("tests passed \u{221a}\r\n".as_bytes(), true, never),
+            Some("tests passed \u{221a}".to_owned())
+        );
+        assert_eq!(
+            decode_line(b"done\r\r\n", false, never),
+            Some("done".to_owned())
+        );
+    }
+
+    /// A byte UTF-8 cannot read is handed to the platform's code page, not replaced.
+    #[test]
+    fn bytes_that_are_not_utf8_are_read_in_the_legacy_code_page() {
+        let cp437 = |bytes: &[u8]| -> Option<String> {
+            Some(
+                bytes
+                    .iter()
+                    .map(|byte| {
+                        if *byte == 0xFB {
+                            '\u{221a}'
+                        } else {
+                            char::from(*byte)
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            decode_line(b"ok \xFB\r\n", true, cp437),
+            Some("ok \u{221a}".to_owned())
+        );
+        // With no code page to read them in, they are replaced as before.
+        assert_eq!(
+            decode_line(b"ok \xFB\n", false, |_| None),
+            Some("ok \u{fffd}".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_legacy_code_page_is_never_utf8() {
+        assert_eq!(legacy_code_page(437, 437), Some(437));
+        assert_eq!(legacy_code_page(0, 850), Some(850));
+        assert_eq!(legacy_code_page(65001, 437), Some(437));
+        assert_eq!(legacy_code_page(65001, 65001), None);
+        assert_eq!(legacy_code_page(0, 0), None);
+    }
+
+    #[test]
+    fn a_blank_line_is_dropped_only_where_asked() {
+        for blank in [&b"\r\n"[..], b"\n", b"   \r\n", b"\t\n", b""] {
+            assert_eq!(decode_line(blank, true, |_| None), None, "{blank:?}");
+        }
+        assert_eq!(decode_line(b"\r\n", false, |_| None), Some(String::new()));
+    }
+
+    /// The real conversion: the OEM code pages a .NET program writes `√` in.
+    #[cfg(windows)]
+    #[test]
+    fn a_square_root_in_an_oem_code_page_reads_as_one() {
+        assert_eq!(
+            code_page_text(437, b"ok \xFB"),
+            Some("ok \u{221a}".to_owned())
+        );
+        assert_eq!(code_page_text(866, b"\xFB"), Some("\u{221a}".to_owned()));
+        assert_eq!(code_page_text(437, b""), Some(String::new()));
+    }
 }
 
 #[cfg(test)]

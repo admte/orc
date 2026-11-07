@@ -42,6 +42,7 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 windows-service = "0.7"
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
