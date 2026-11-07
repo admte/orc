@@ -3275,7 +3275,7 @@ fn report_stop(app: &str, version: &str, outcome: &StopOutcome, settings: &CliSe
     match outcome.how {
         StopHow::Graceful => eprintln!("Stopped {app}:{version}"),
         StopHow::Killed => {
-            eprintln!("{app}:{version} did not end within its grace period and was killed");
+            eprintln!("{app}:{version} did not end within its stop time and was killed");
         }
         StopHow::Forced => eprintln!("Ended {app}:{version} immediately, as asked"),
     }

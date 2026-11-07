@@ -129,9 +129,10 @@ fn phases(config: &AppConfig) -> Vec<String> {
         phases.push(label);
     }
     if let Some(stop) = &config.stop {
-        // The stop phase reads as the sequence it is: the signal, the window the stop
-        // command runs in, and the grace the app gets after it — defaults included,
-        // since they are what decides how long a stop of this app takes.
+        // The stop phase reads as the sequence it is: the signal, the timeout the stop
+        // command and the app's own wind-down share, and the least the app gets after
+        // the ask — defaults included, since they decide how long a stop of this app
+        // takes.
         let mut label = format!(
             "stop ({}, {}, grace {})",
             stop.signal.as_deref().unwrap_or("SIGTERM"),

@@ -25,17 +25,19 @@ use crate::v2::{self, Context as V2Context, Phase as V2Phase};
 /// Per-instance directory under the app work dir for start-phase file-backed params.
 const PARAM_DIR: &str = ".orc-params";
 
-/// How long the stop command may run while the app is still alive, unless the recipe
-/// says otherwise.
+/// How long an orderly stop may take, unless the recipe says otherwise: the stop
+/// command and the app's own exit after the ask share this window, counted from the
+/// stop request.
 pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long the app has to end after the stop signal, unless the recipe says otherwise.
-/// Granted in full after the stop command, however long that took.
 /// Grace given to a subprocess app when the runtime itself is exiting (shutdown,
 /// upgrade, host reboot). Deliberately short and not configurable: the app's own
 /// budget is for orchestrated stops, not for holding up a restart of the runtime.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// The least time the app has to end after it is asked, unless the recipe says
+/// otherwise. Granted in full however late the ask comes — a stop command that used the
+/// whole stop timeout still leaves the app this long.
 pub const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// How long the stopped hook may run, unless the recipe says otherwise.
@@ -764,8 +766,9 @@ pub fn shim_argv(
 /// The definition the runtime writes for a runtime-managed service.
 ///
 /// Generated from the app's config alone — restart policy from `start.restart`, kill
-/// signal from `stop.signal`, the manager's own stop timeout from `stop.grace` — which
-/// is what lets app packages ship no unit files, plists, or registration code.
+/// signal from `stop.signal`, the manager's own stop timeout from the app's
+/// [`stop_window`] — which is what lets app packages ship no unit files, plists, or
+/// registration code.
 #[must_use]
 pub fn managed_service_spec(
     app: &str,
@@ -816,10 +819,7 @@ pub fn managed_service_spec(
         work_dir: work_dir.to_path_buf(),
         restart,
         kill_signal,
-        stop_timeout: configured_duration(
-            stop.and_then(|stop| stop.grace.as_deref()),
-            DEFAULT_STOP_GRACE,
-        ),
+        stop_timeout: stop_window(config),
     }
 }
 
@@ -920,17 +920,20 @@ pub async fn exec_app(work_dir: &Path, app: &str, instance: &str, version: &str)
                 "app config does not define a service to run as".to_owned(),
             ));
         };
-        let grace = configured_duration(
-            config.stop.as_ref().and_then(|stop| stop.grace.as_deref()),
-            DEFAULT_STOP_GRACE,
-        );
+        let signal = config
+            .stop
+            .as_ref()
+            .and_then(|stop| stop.signal.as_deref())
+            .and_then(|value| StopSignal::parse(value).ok())
+            .unwrap_or_default();
         crate::service::scm::host(crate::service::scm::HostContext {
             work_dir: work_dir.to_path_buf(),
             app: app.to_owned(),
             instance: instance.to_owned(),
             version: version.to_owned(),
             service_name,
-            grace,
+            signal,
+            stop_window: stop_window(&config),
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -994,8 +997,10 @@ async fn shim_start_command(
 /// control into the app's own termination.
 ///
 /// Windows cannot replace the shim with the app — there is no `exec`, and the SCM needs
-/// a process that speaks its protocol — so the app runs as the shim's child and the
-/// shim ends it: no signal, the app's grace period, then the tree.
+/// a process that speaks its protocol — so the app runs as the shim's child, on a
+/// console the shim owns, and the shim ends it: the console's stop event standing in
+/// for `stop.signal`, the app's [`stop_window`] to finish its work and end, then the
+/// tree.
 #[cfg(windows)]
 pub(crate) async fn run_hosted_app(
     context: &crate::service::scm::HostContext,
@@ -1015,6 +1020,17 @@ pub(crate) async fn run_hosted_app(
         &app,
         &instance,
     ));
+    // Before the app starts, so the app is born on the console the stop is sent to.
+    let askable = match crate::console::own_console() {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::debug!(app = %app, instance = %instance, error = %err, "no console to ask the app on");
+            let line = "app cannot be asked to stop; it will be ended when its stop time runs out";
+            tracing::warn!(app = %app, instance = %instance, "{line}");
+            out.line(line);
+            false
+        }
+    };
     let start = match shim_start_command(
         &context.work_dir,
         &context.app,
@@ -1023,7 +1039,13 @@ pub(crate) async fn run_hosted_app(
     )
     .await
     {
-        Ok(start) => start,
+        Ok(mut start) => {
+            // A service has no input, and an app on the host's console must not read
+            // it: a batch file interrupted by the stop would wait there for an answer to
+            // "Terminate batch job (Y/N)?" until the kill.
+            start.command.stdin(std::process::Stdio::null());
+            start
+        }
         Err(err) => {
             tracing::error!(app = %app, instance = %instance, error = %err, "app could not be started");
             out.line(&format!("app could not be started: {err}"));
@@ -1052,17 +1074,7 @@ pub(crate) async fn run_hosted_app(
     };
     let status = tokio::select! {
         status = child.wait() => status,
-        () = stop.cancelled() => {
-            tracing::info!(app = %app, instance = %instance, grace_s = context.grace.as_secs(), "app given time to stop");
-            let mut process = AppProcess::subprocess(&mut child, std::time::Instant::now());
-            if let Ok(status) = tokio::time::timeout(context.grace, process.wait()).await {
-                status
-            } else {
-                tracing::warn!(app = %app, instance = %instance, "app killed after the grace period");
-                process.kill().await;
-                process.wait().await
-            }
-        }
+        () = stop.cancelled() => end_hosted_app(context, &mut child, askable, &out).await,
     };
     // Withdrawn now the app has exited, not the moment it was spawned. The shim keeps
     // running while the app does, so an early withdrawal is a race the app loses: it
@@ -1080,6 +1092,47 @@ pub(crate) async fn run_hosted_app(
             1
         }
     }
+}
+
+/// The hosted app's end once the manager asked for it: the console's stop event, the
+/// app's stop window to finish its work and end, then the tree.
+#[cfg(windows)]
+async fn end_hosted_app(
+    context: &crate::service::scm::HostContext,
+    child: &mut Child,
+    askable: bool,
+    out: &crate::service::scm::ServiceLog,
+) -> std::io::Result<ExitStatus> {
+    let (app, instance) = (&context.app, &context.instance);
+    let wait = context.stop_window;
+    let event = crate::console::CtrlEvent::for_signal(context.signal);
+    let asked = askable
+        && crate::console::ask(event)
+            .inspect_err(|err| {
+                tracing::debug!(app = %app, instance = %instance, error = %err, "console stop event not sent");
+                tracing::warn!(app = %app, instance = %instance, "app could not be asked to stop");
+            })
+            .is_ok();
+    let line = if asked {
+        format!(
+            "app asked to stop ({}); waiting up to {}s for it to end",
+            event.as_str(),
+            wait.as_secs()
+        )
+    } else {
+        format!("app given {}s to stop", wait.as_secs())
+    };
+    tracing::info!(app = %app, instance = %instance, wait_s = wait.as_secs(), "{line}");
+    out.line(&line);
+    let mut process = AppProcess::subprocess(child, std::time::Instant::now());
+    if let Ok(status) = tokio::time::timeout(wait, process.wait()).await {
+        return status;
+    }
+    let line = format!("app killed: it did not stop within {}s", wait.as_secs());
+    tracing::warn!(app = %app, instance = %instance, wait_s = wait.as_secs(), "{line}");
+    out.line(&line);
+    process.kill().await;
+    process.wait().await
 }
 
 struct PhaseCommand {
@@ -2381,7 +2434,8 @@ pub(crate) fn parse_duration(value: &str) -> Result<Duration> {
 //
 // Ending an app is a sequence, not a signal: the app's own stop command runs first,
 // while the app is still alive and can still do something about it; then the signal
-// the app listens for; then, after a grace period nothing shortens, the kill. Whatever
+// the app listens for; then, once the stop timeout has run out — and never sooner than
+// the grace after the ask — the kill. Whatever
 // the app ends by — this sequence, a crash, or its own last line — the stopped hook
 // runs afterwards and is told what happened.
 
@@ -2485,9 +2539,9 @@ impl std::fmt::Display for StopStatus {
 /// How the app actually ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopHow {
-    /// It ended by itself, within the grace period.
+    /// It ended by itself, in time.
     Graceful,
-    /// The grace period ran out and the runtime killed it.
+    /// Its time ran out and the runtime killed it.
     Killed,
     /// The runtime was told to stop waiting and killed it straight away.
     Forced,
@@ -2593,20 +2647,22 @@ pub struct AppContext<'a> {
     pub log_line: LogLine,
 }
 
-/// Longest a termination of this app can take: the stop command, the grace period, and
-/// the stopped hook. Callers can sum this across supervised apps to budget a runtime
-/// shutdown.
+/// Longest a termination of this app can take: the orderly stop, the grace after a late
+/// ask, and the stopped hook. Callers can sum this across supervised apps to budget a
+/// runtime shutdown.
 ///
-/// A phase the app does not declare costs nothing — except the grace period, which is
-/// granted to every app that has to be signalled, declared or not. Capped at a day, so
-/// one recipe asking for an hour of grace cannot make the whole figure meaningless.
+/// The stop command and the app's own exit share `stop.timeout`, so an app that is asked
+/// at once may use all of it to finish its work; one asked only when its stop command
+/// ran out still gets its grace on top. A stopped hook the app does not declare costs
+/// nothing. Capped at a day, so one recipe asking for a week cannot make the whole
+/// figure meaningless.
 #[must_use]
 pub fn stop_budget(app: &str, config: &AppConfig, work_dir: &Path) -> Duration {
     let stop = config.stop.as_ref();
     // A stop command may be declared in the config or shipped as a `stop-<app>` script;
-    // both hold the stop up for `stop.timeout`, so both are charged. Resolving it the
-    // same way the sequence does is what keeps the budget an honest upper bound — a
-    // script-only stop that reported no timeout would understate the required budget.
+    // both can hold the ask back to the end of `stop.timeout`, so both are charged the
+    // grace on top. Resolving it the same way the sequence does is what keeps the budget
+    // an honest upper bound.
     let has_command = match config.format {
         AppFormat::V1 => {
             stop.is_some_and(|stop| stop.command.is_some())
@@ -2617,23 +2673,45 @@ pub fn stop_budget(app: &str, config: &AppConfig, work_dir: &Path) -> Duration {
             .and_then(|stop| stop.command.as_ref())
             .is_some_and(|command| !is_empty_argv(command)),
     };
-    let command = if has_command {
-        stop.map_or(DEFAULT_STOP_TIMEOUT, |stop| {
-            configured_duration(stop.timeout.as_deref(), DEFAULT_STOP_TIMEOUT)
-        })
+    let (timeout, grace) = stop_timings(config);
+    let orderly = if has_command {
+        timeout.saturating_add(grace)
     } else {
-        Duration::ZERO
+        timeout.max(grace)
     };
-    let grace = stop.map_or(DEFAULT_STOP_GRACE, |stop| {
-        configured_duration(stop.grace.as_deref(), DEFAULT_STOP_GRACE)
-    });
     let stopped = config.stopped.as_ref().map_or(Duration::ZERO, |stopped| {
         configured_duration(stopped.timeout.as_deref(), DEFAULT_STOPPED_TIMEOUT)
     });
-    command
-        .saturating_add(grace)
+    orderly
         .saturating_add(stopped)
         .min(Duration::from_secs(24 * 60 * 60))
+}
+
+/// How long an app may take to end once it has been asked, at most: its stop timeout,
+/// or its grace when that is longer.
+///
+/// What a service manager is told to wait before it kills the app on its own — the
+/// generated unit's stop timeout, the Windows host's deadline — so that a manager never
+/// cuts short a stop the runtime is still prepared to wait for.
+#[must_use]
+pub fn stop_window(config: &AppConfig) -> Duration {
+    let (timeout, grace) = stop_timings(config);
+    timeout.max(grace)
+}
+
+/// `stop.timeout` and `stop.grace`, with the defaults where the recipe is silent.
+fn stop_timings(config: &AppConfig) -> (Duration, Duration) {
+    let stop = config.stop.as_ref();
+    (
+        configured_duration(
+            stop.and_then(|stop| stop.timeout.as_deref()),
+            DEFAULT_STOP_TIMEOUT,
+        ),
+        configured_duration(
+            stop.and_then(|stop| stop.grace.as_deref()),
+            DEFAULT_STOP_GRACE,
+        ),
+    )
 }
 
 /// A configured duration, or the default when it is absent or unreadable. Unreadable
@@ -2829,11 +2907,12 @@ async fn run_stop_command(
     outcome
 }
 
-/// Ends one app: its stop command, then the signal, then the kill.
+/// Ends one app: its stop command, then the ask, then the kill.
 ///
-/// Steps 1 and 2 are the ask; step 3 is not optional. The grace period is granted in
-/// full once the app has been asked — a stop command that ran long does not eat into
-/// the time the app itself gets — and `force` collapses the whole sequence to the kill.
+/// Steps 1 and 2 are the ask; step 3 is not optional. Both share the stop timeout,
+/// counted from the request: once asked, the app has what the stop command left of it
+/// to finish its work and end, and never less than its grace — a stop command that ran
+/// long does not eat into that floor. `force` collapses the whole sequence to the kill.
 ///
 /// The stopped hook is **not** run here: it runs after every exit, including the ones
 /// this sequence never saw, so it belongs to the caller that owns the app's lifetime.
@@ -2844,6 +2923,7 @@ pub async fn stop_sequence(
     reason: StopReason,
     force: &CancellationToken,
 ) -> StopOutcome {
+    let requested = std::time::Instant::now();
     let started = process.started();
     let pid = process.pid();
     let stop = ctx.config.stop.as_ref();
@@ -2862,16 +2942,16 @@ pub async fn stop_sequence(
     // The runtime is going away itself: an upgrade or a host reboot must not wait out a
     // CI drain, so the app gets the signal and a short fixed grace, and its stop command
     // never runs. An app whose work must outlive the runtime declares service mode.
-    let (grace, quiesce_first) = match reason {
-        StopReason::Shutdown => (SHUTDOWN_GRACE.min(grace), false),
-        _ => (grace, true),
+    let (window, grace, quiesce_first) = match reason {
+        StopReason::Shutdown => (Duration::ZERO, SHUTDOWN_GRACE.min(grace), false),
+        _ => (timeout, grace, true),
     };
     let signal = stop_signal(ctx);
     tracing::info!(
         app = %ctx.app,
         instance = %ctx.instance,
         reason = %reason,
-        timeout_s = timeout.as_secs(),
+        timeout_s = window.as_secs(),
         grace_s = grace.as_secs(),
         "app stop requested"
     );
@@ -2896,10 +2976,14 @@ pub async fn stop_sequence(
         early_exit = exit;
     }
 
-    // ── 2/3. the signal, the grace period, and the kill ──
+    // ── 2/3. the ask, the wait, and the kill ──
+    // The stop timeout is the app's whole orderly stop, not the stop command's alone:
+    // whatever the command left of it is the app's to finish its work in once asked,
+    // and never less than the grace.
+    let wait = window.saturating_sub(requested.elapsed()).max(grace);
     let (how, status) = match early_exit {
         Some(result) => (StopHow::Graceful, result.ok()),
-        None => end_the_app(ctx, process, signal, grace, force).await,
+        None => end_the_app(ctx, process, signal, wait, force).await,
     };
 
     let run_duration = started.elapsed();
@@ -2915,13 +2999,13 @@ pub async fn stop_sequence(
     }
 }
 
-/// Signals the app, grants it the grace period, and kills it if that runs out — or
+/// Asks the app to end, waits up to `wait` for it to, and kills it if that runs out — or
 /// kills it straight away when the caller has stopped waiting.
 async fn end_the_app(
     ctx: &AppContext<'_>,
     process: &mut AppProcess<'_>,
     signal: StopSignal,
-    grace: Duration,
+    wait: Duration,
     force: &CancellationToken,
 ) -> (StopHow, Option<ExitStatus>) {
     if force.is_cancelled() {
@@ -2930,36 +3014,36 @@ async fn end_the_app(
     }
     // A Unix child gets the signal it declared; a service gets its manager's stop. On
     // Windows a child gets nothing to act on — there the stop command was the whole
-    // ask, and the grace period is the app's chance to finish acting on it.
+    // ask, and the wait is the app's chance to finish acting on it.
     match process.signal(signal).await {
         StopAsk::Signal(signal) => tracing::info!(
             app = %ctx.app,
             instance = %ctx.instance,
             signal = %signal.as_str(),
-            grace_s = grace.as_secs(),
+            wait_s = wait.as_secs(),
             "app asked to stop"
         ),
         StopAsk::Manager => tracing::info!(
             app = %ctx.app,
             instance = %ctx.instance,
-            grace_s = grace.as_secs(),
+            wait_s = wait.as_secs(),
             "service asked to stop"
         ),
         StopAsk::None => tracing::info!(
             app = %ctx.app,
             instance = %ctx.instance,
-            grace_s = grace.as_secs(),
+            wait_s = wait.as_secs(),
             "app given time to stop"
         ),
     }
     let how = tokio::select! {
         result = process.wait() => return (StopHow::Graceful, result.ok()),
-        () = tokio::time::sleep(grace) => {
+        () = tokio::time::sleep(wait) => {
             tracing::warn!(
                 app = %ctx.app,
                 instance = %ctx.instance,
-                grace_s = grace.as_secs(),
-                "app killed after the grace period"
+                wait_s = wait.as_secs(),
+                "app killed: it did not stop in time"
             );
             StopHow::Killed
         }
@@ -4646,12 +4730,14 @@ mod tests {
     #[test]
     fn the_stop_budget_sums_the_phases_that_can_hold_a_stop_up() {
         let empty = tempfile::tempdir().expect("dir");
-        // Nothing declared: the app is still signalled and still gets its grace.
+        // Nothing declared: the app is asked, and has the default stop timeout to end.
         assert_eq!(
             stop_budget("demo", &AppConfig::default(), empty.path()),
-            DEFAULT_STOP_GRACE
+            DEFAULT_STOP_TIMEOUT
         );
 
+        // A stop command can hold the ask back to the end of the timeout, and the app
+        // still gets its grace after it.
         let full: AppConfig = serde_json::from_value(serde_json::json!({
             "stop": {"command": "./drain.sh", "timeout": "45s", "grace": "20s"},
             "stopped": {"command": "./report.sh", "timeout": "90s"}
@@ -4662,19 +4748,24 @@ mod tests {
             Duration::from_secs(45 + 20 + 90)
         );
 
-        // A stop phase with no command costs nothing but its grace; the defaults apply
-        // wherever the recipe stays silent.
+        // With no command the app is asked at once: its stop timeout or its grace,
+        // whichever is longer; the defaults apply wherever the recipe stays silent.
         let bare: AppConfig =
             serde_json::from_value(serde_json::json!({"stop": {}, "stopped": {}})).expect("config");
         assert_eq!(
             stop_budget("demo", &bare, empty.path()),
-            DEFAULT_STOP_GRACE + DEFAULT_STOPPED_TIMEOUT
+            DEFAULT_STOP_TIMEOUT + DEFAULT_STOPPED_TIMEOUT
+        );
+        let long_grace: AppConfig =
+            serde_json::from_value(serde_json::json!({"stop": {"grace": "60s"}})).expect("config");
+        assert_eq!(
+            stop_budget("demo", &long_grace, empty.path()),
+            Duration::from_secs(60)
         );
     }
 
-    /// A packaged `stop-{app}` script holds the stop up for exactly as long as a
-    /// configured command does, and the budget has to say so: a script-only stop that
-    /// reporting only its grace would understate the time allowed for draining.
+    /// A packaged `stop-{app}` script holds the ask back exactly as a configured command
+    /// does, and the budget has to say so.
     #[cfg(unix)]
     #[test]
     fn the_stop_budget_charges_a_packaged_stop_script() {
@@ -4685,16 +4776,44 @@ mod tests {
                 .expect("config");
         assert_eq!(
             stop_budget("demo", &config, work.path()),
-            DEFAULT_STOP_GRACE.max(Duration::from_secs(30)),
-            "with no script packaged only the grace is charged"
+            Duration::from_secs(30 * 60),
+            "with no script packaged the app is asked at once and has its whole timeout"
         );
 
         std::fs::write(work.path().join("stop-demo.sh"), b"exit 0").expect("script");
         assert_eq!(
             stop_budget("demo", &config, work.path()),
             Duration::from_secs(30 * 60 + 30),
-            "the packaged script is charged its configured timeout"
+            "a packaged script can use the timeout, and the grace follows it"
         );
+    }
+
+    /// What a service manager is told to wait before it kills on its own is the longest
+    /// the runtime will wait itself, so the manager never cuts a stop short.
+    #[test]
+    fn a_managed_service_waits_out_the_apps_stop_window() {
+        let config: AppConfig = serde_json::from_value(serde_json::json!({
+            "start": {"command": "run.sh", "service": "demo"},
+            "stop": {"timeout": "1h", "grace": "30s"}
+        }))
+        .expect("config");
+        assert_eq!(stop_window(&config), Duration::from_secs(3600));
+        let spec = managed_service_spec(
+            "demo",
+            "",
+            "default",
+            &config,
+            Path::new("/work"),
+            "demo",
+            Path::new("/usr/bin/orc-agent"),
+        );
+        assert_eq!(spec.stop_timeout, Duration::from_secs(3600));
+
+        let long_grace: AppConfig =
+            serde_json::from_value(serde_json::json!({"stop": {"timeout": "5s", "grace": "60s"}}))
+                .expect("config");
+        assert_eq!(stop_window(&long_grace), Duration::from_secs(60));
+        assert_eq!(stop_window(&AppConfig::default()), DEFAULT_STOP_TIMEOUT);
     }
 
     /// The stop command resolves like every other phase: the configured command first,
@@ -4821,14 +4940,14 @@ mod tests {
         );
     }
 
-    /// When nothing in the app acts on the stop signal, the kill at the end of the grace
-    /// period reaches the wrapper's child too.
+    /// When nothing in the app acts on the stop signal, the kill at the end of its stop
+    /// time reaches the wrapper's child too.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_grace_expiry_kill_reaches_what_a_string_commands_shell_started() {
+    async fn the_kill_when_time_runs_out_reaches_what_a_string_commands_shell_started() {
         let env = StopEnv::new(serde_json::json!({
             "start": {"command": "trap '' TERM; sh -c 'sleep 600 & echo $! > sleeper.pid; wait'"},
-            "stop": {"grace": "1s"}
+            "stop": {"timeout": "1s", "grace": "1s"}
         }));
         let mut app = env.start().await;
         let sleeper = Grandchild::recorded_in(env.work.path()).await;
@@ -5078,8 +5197,105 @@ mod tests {
         assert_eq!(outcome.exit.signal, Some(9));
     }
 
-    /// The grace period belongs to the app, not to what is left of the stop timeout: an
-    /// app that takes a moment to shut down after a slow stop command still gets to.
+    /// The stop timeout is the app's to finish its work in, not the stop command's
+    /// alone: an app asked at once that needs longer than its grace to wind down is
+    /// waited for, up to the timeout, and ends on its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_asked_app_has_its_whole_stop_timeout_to_finish_its_work() {
+        let env = StopEnv::new(serde_json::json!({
+            "stop": {"timeout": "10s", "grace": "1s"}
+        }));
+        // Three seconds of work after the signal: three times the grace.
+        let mut app = env.spawn("trap 'sleep 3; exit 7' TERM\ntouch app-ready\nsleep 30 &\nwait\n");
+        env.wait_for_file("app-ready").await;
+        let asked = std::time::Instant::now();
+        let outcome = env
+            .stop(&mut app, StopReason::Terminate, &CancellationToken::new())
+            .await;
+
+        assert_eq!(outcome.how, StopHow::Graceful, "the app must not be killed");
+        assert_eq!(outcome.exit.code, Some(7));
+        assert!(asked.elapsed() >= Duration::from_secs(3));
+    }
+
+    /// An app that never ends is killed when the stop timeout runs out — after the
+    /// timeout, not after the much shorter grace.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_app_that_ignores_the_ask_is_killed_when_the_stop_timeout_runs_out() {
+        let env = StopEnv::new(serde_json::json!({
+            "stop": {"timeout": "3s", "grace": "1s"}
+        }));
+        let mut app = env.spawn("trap '' TERM\ntouch app-ready\nsleep 30 &\nwait\n");
+        env.wait_for_file("app-ready").await;
+        let asked = std::time::Instant::now();
+        let outcome = env
+            .stop(&mut app, StopReason::Terminate, &CancellationToken::new())
+            .await;
+
+        assert_eq!(outcome.how, StopHow::Killed);
+        assert_eq!(outcome.exit.signal, Some(9));
+        let took = asked.elapsed();
+        assert!(
+            took >= Duration::from_secs(3) && took < Duration::from_secs(10),
+            "killed after the timeout, took {took:?}"
+        );
+    }
+
+    /// The operator stopping the wait ends an orderly stop already under way at once,
+    /// however much of its timeout is left.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_force_mid_wait_kills_at_once() {
+        let env = StopEnv::new(serde_json::json!({
+            "stop": {"timeout": "1h", "grace": "30s"}
+        }));
+        let mut app = env.spawn("trap '' TERM\ntouch app-ready\nsleep 600 &\nwait\n");
+        env.wait_for_file("app-ready").await;
+        let force = CancellationToken::new();
+        let escalate = force.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            escalate.cancel();
+        });
+        let asked = std::time::Instant::now();
+        let outcome = env.stop(&mut app, StopReason::Terminate, &force).await;
+
+        assert_eq!(outcome.how, StopHow::Forced);
+        assert!(
+            asked.elapsed() < Duration::from_secs(10),
+            "the force did not wait out the stop timeout"
+        );
+    }
+
+    /// A stop command and the app's own wind-down share one timeout: what the command
+    /// used is not given again after the ask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_stop_command_and_the_wind_down_share_the_stop_timeout() {
+        let env = StopEnv::new(serde_json::json!({
+            "stop": {"command": "sleep 2", "timeout": "4s", "grace": "1s"}
+        }));
+        let mut app = env.spawn("trap '' TERM\ntouch app-ready\nsleep 30 &\nwait\n");
+        env.wait_for_file("app-ready").await;
+        let asked = std::time::Instant::now();
+        let outcome = env
+            .stop(&mut app, StopReason::Terminate, &CancellationToken::new())
+            .await;
+
+        assert_eq!(outcome.stop_status, StopStatus::Ok);
+        assert_eq!(outcome.how, StopHow::Killed);
+        let took = asked.elapsed();
+        assert!(
+            took >= Duration::from_secs(4) && took < Duration::from_secs(6),
+            "killed when the shared timeout ran out, took {took:?}"
+        );
+    }
+
+    /// The grace is the app's floor, not what is left of the stop timeout: an app that
+    /// takes a moment to shut down after a stop command that used the whole timeout
+    /// still gets to.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_grace_period_is_granted_in_full_after_a_slow_stop_command() {
@@ -5104,7 +5320,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_kill_reaches_a_grandchild() {
-        let env = StopEnv::new(serde_json::json!({"stop": {"grace": "1s"}}));
+        let env = StopEnv::new(serde_json::json!({"stop": {"timeout": "1s", "grace": "1s"}}));
         let mut app = env.spawn("trap '' TERM\nsleep 300 &\necho $! > grandchild.pid\nwait\n");
         let grandchild = env.wait_for_pid("grandchild.pid").await;
         assert!(pid_alive(grandchild), "the grandchild is running");
@@ -5188,7 +5404,7 @@ mod tests {
     #[tokio::test]
     async fn the_stopped_hook_describes_a_killed_app() {
         let env = StopEnv::new(serde_json::json!({
-            "stop": {"grace": "1s"},
+            "stop": {"timeout": "1s", "grace": "1s"},
             "stopped": {"command": STOPPED_REPORT, "timeout": "10s"}
         }));
         let mut app = env.spawn("trap '' TERM\ntouch app-ready\nsleep 30 &\nwait\n");
@@ -5518,15 +5734,15 @@ mod tests {
         assert_eq!(manager.events(), vec!["stop"]);
     }
 
-    /// A stop the manager never lands is exactly what the grace period is for: the
-    /// service is killed when it runs out, and the app is reported killed rather than
+    /// A stop the manager never lands is exactly what the kill is for: the service is
+    /// killed when its stop time runs out, and the app is reported killed rather than
     /// left running behind a stop that quietly did nothing.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_service_whose_stop_never_lands_is_killed_after_the_grace() {
+    async fn a_service_whose_stop_never_lands_is_killed_when_its_time_runs_out() {
         let env = StopEnv::new(serde_json::json!({
             "start": { "command": "run.sh", "service": "demo" },
-            "stop": { "grace": "1s" }
+            "stop": { "timeout": "1s", "grace": "1s" }
         }));
         let manager = FakeManager::new(false);
         let outcome = env

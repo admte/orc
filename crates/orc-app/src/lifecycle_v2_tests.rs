@@ -949,10 +949,10 @@ fn a_v2_app_discovers_no_scripts() {
             .expect("resolve")
             .is_none()
     );
-    // A stop with no declared command charges only its grace.
+    // A stop with no declared command is asked at once: no grace on top of its timeout.
     assert_eq!(
         stop_budget("demo", &config, work.path()),
-        Duration::from_secs(5)
+        crate::lifecycle::DEFAULT_STOP_TIMEOUT
     );
     // `[]` skips a phase on purpose.
     let skipped = v2(serde_json::json!({"start": {"command": [], "service": "demo"}}));

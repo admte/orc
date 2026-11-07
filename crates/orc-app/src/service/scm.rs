@@ -215,7 +215,7 @@ impl ServiceBackend for Scm {
 
     async fn stop(&self, name: &str) -> Result<()> {
         let service = open(name, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
-        // `ControlService` posts the stop and returns; the grace period and the kill
+        // `ControlService` posts the stop and returns; the wait and the kill
         // behind it belong to the termination sequence.
         match service.stop() {
             Ok(_) => {}
@@ -497,7 +497,8 @@ fn trim_end(line: &[u8]) -> &[u8] {
 // A runtime-managed service's registered binary invokes the runtime's app-exec shim.
 // Under the SCM that process must be a service main: register a control handler, report
 // running, and report stopped when it is done. It hosts the app as its child — Windows
-// has no exec — and translates the stop control into the app's own termination.
+// has no exec — and translates the stop control into the app's own termination: a
+// console stop event the app can act on, its stop window, then the kill.
 
 /// What the app the shim hosts is, stashed before the SCM dispatcher starts.
 ///
@@ -509,9 +510,11 @@ pub struct HostContext {
     pub instance: String,
     pub version: String,
     pub service_name: String,
-    /// The app's own grace period: how long it has to end after the stop control
-    /// before the shim ends it.
-    pub grace: Duration,
+    /// What the app listens for (`stop.signal`), delivered as a console stop event.
+    pub signal: crate::process::StopSignal,
+    /// How long the app has to end after the stop control before the shim ends it
+    /// ([`crate::lifecycle::stop_window`]).
+    pub stop_window: Duration,
 }
 
 /// Set once by [`host`], read once by the service main.
@@ -574,7 +577,23 @@ fn run_hosted() -> Result<()> {
         .enable_all()
         .build()
         .map_err(|err| operational("start the app runtime", err))?;
-    let exit = runtime.block_on(crate::lifecycle::run_hosted_app(context, &stop));
+    let exit = runtime.block_on(async {
+        let app = crate::lifecycle::run_hosted_app(context, &stop);
+        tokio::pin!(app);
+        tokio::select! {
+            exit = &mut app => return exit,
+            () = stop.cancelled() => {}
+        }
+        // Told once, with the whole wait: the manager then knows the stop is under way
+        // and how long it may take, and nothing has to keep reassuring it.
+        report(
+            ScmState::StopPending,
+            ServiceControlAccept::empty(),
+            context.stop_window.saturating_add(Duration::from_secs(30)),
+            0,
+        );
+        app.await
+    });
 
     report(
         ScmState::Stopped,
