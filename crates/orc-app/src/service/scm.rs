@@ -542,6 +542,9 @@ pub struct HostContext {
     /// How long the app has to end after the stop control before the shim ends it
     /// ([`crate::lifecycle::stop_window`]).
     pub stop_window: Duration,
+    /// How long an app the console could not ask has to end before the shim ends it
+    /// (`stop.grace`).
+    pub grace: Duration,
 }
 
 /// Set once by [`host`], read once by the service main.
@@ -616,7 +619,7 @@ fn run_hosted() -> Result<()> {
         report(
             ScmState::StopPending,
             ServiceControlAccept::empty(),
-            context.stop_window.saturating_add(Duration::from_secs(30)),
+            context.stop_window,
             0,
         );
         app.await

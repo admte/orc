@@ -69,12 +69,15 @@ pub fn own_console() -> std::io::Result<()> {
     Ok(())
 }
 
-/// The host's own handler: the stop events it sends are for the app, never for itself.
+/// The host's own handler: it handles every console event, so none of them ends the
+/// host. The stop events it sends are for the app; a log-off or a shutdown reaches the
+/// console of a service too, and the default handler would end the host there without
+/// it ever telling the service manager it stopped. Only the service manager's controls
+/// end the host.
 #[cfg(windows)]
 #[allow(unsafe_code, reason = "a console control handler is a C callback")]
-unsafe extern "system" fn ignore_stop(event: u32) -> windows_sys::Win32::Foundation::BOOL {
-    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
-    i32::from(event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT)
+unsafe extern "system" fn ignore_stop(_event: u32) -> windows_sys::Win32::Foundation::BOOL {
+    1
 }
 
 /// Sends `event` to every process on this process's console.
@@ -153,6 +156,28 @@ mod tests {
             std::fs::read_to_string(dir.path().join("host-outcome")).ok()
         );
         assert!(dir.path().join("asked").exists(), "the app heard the ask");
+    }
+
+    /// Every console event is the host's to ignore — the log-off and shutdown events a
+    /// service's console receives included, which would otherwise end the host.
+    #[cfg(windows)]
+    #[test]
+    #[allow(unsafe_code, reason = "calls the handler as the console would")]
+    fn the_host_survives_every_console_event() {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+        for event in [
+            CTRL_C_EVENT,
+            CTRL_BREAK_EVENT,
+            CTRL_CLOSE_EVENT,
+            CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        ] {
+            // SAFETY: the handler reads nothing but its argument.
+            assert_eq!(unsafe { ignore_stop(event) }, 1, "event {event}");
+        }
     }
 
     #[cfg(windows)]
