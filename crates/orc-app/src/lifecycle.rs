@@ -934,6 +934,7 @@ pub async fn exec_app(work_dir: &Path, app: &str, instance: &str, version: &str)
             service_name,
             signal,
             stop_window: stop_window(&config),
+            grace: stop_timings(&config, |_, _| {}).1,
         })
     }
     #[cfg(not(any(unix, windows)))]
@@ -1024,10 +1025,10 @@ pub(crate) async fn run_hosted_app(
     let askable = match crate::console::own_console() {
         Ok(()) => true,
         Err(err) => {
-            tracing::debug!(app = %app, instance = %instance, error = %err, "no console to ask the app on");
-            let line = "app cannot be asked to stop; it will be ended when its stop time runs out";
-            tracing::warn!(app = %app, instance = %instance, "{line}");
-            out.line(line);
+            tracing::warn!(app = %app, instance = %instance, error = %err, "app cannot be asked to stop; it will be given its grace and then ended");
+            out.line(&format!(
+                "app cannot be asked to stop; it will be given its grace and then ended: {err}"
+            ));
             false
         }
     };
@@ -1104,15 +1105,20 @@ async fn end_hosted_app(
     out: &crate::service::scm::ServiceLog,
 ) -> std::io::Result<ExitStatus> {
     let (app, instance) = (&context.app, &context.instance);
-    let wait = context.stop_window;
     let event = crate::console::CtrlEvent::for_signal(context.signal);
     let asked = askable
         && crate::console::ask(event)
             .inspect_err(|err| {
-                tracing::debug!(app = %app, instance = %instance, error = %err, "console stop event not sent");
-                tracing::warn!(app = %app, instance = %instance, "app could not be asked to stop");
+                tracing::warn!(app = %app, instance = %instance, error = %err, "app could not be asked to stop");
             })
             .is_ok();
+    // An app that heard the ask has its stop window to finish its work; one that could
+    // not be asked has nothing it was told to finish, and gets its grace.
+    let wait = if asked {
+        context.stop_window
+    } else {
+        context.grace
+    };
     let line = if asked {
         format!(
             "app asked to stop ({}); waiting up to {}s for it to end",
@@ -2673,7 +2679,7 @@ pub fn stop_budget(app: &str, config: &AppConfig, work_dir: &Path) -> Duration {
             .and_then(|stop| stop.command.as_ref())
             .is_some_and(|command| !is_empty_argv(command)),
     };
-    let (timeout, grace) = stop_timings(config);
+    let (timeout, grace) = stop_timings(config, |_, _| {});
     let orderly = if has_command {
         timeout.saturating_add(grace)
     } else {
@@ -2695,23 +2701,38 @@ pub fn stop_budget(app: &str, config: &AppConfig, work_dir: &Path) -> Duration {
 /// cuts short a stop the runtime is still prepared to wait for.
 #[must_use]
 pub fn stop_window(config: &AppConfig) -> Duration {
-    let (timeout, grace) = stop_timings(config);
+    let (timeout, grace) = stop_timings(config, |_, _| {});
     timeout.max(grace)
 }
 
-/// `stop.timeout` and `stop.grace`, with the defaults where the recipe is silent.
-fn stop_timings(config: &AppConfig) -> (Duration, Duration) {
+/// `stop.timeout` and `stop.grace`, with the defaults where the recipe is silent or
+/// unreadable. The one reader of both: `unreadable` is told each setting that fell back
+/// (its name and value), so the stop itself can say so where the operator sees it while
+/// budgets and service definitions stay quiet.
+fn stop_timings(
+    config: &AppConfig,
+    mut unreadable: impl FnMut(&str, &str),
+) -> (Duration, Duration) {
     let stop = config.stop.as_ref();
-    (
-        configured_duration(
-            stop.and_then(|stop| stop.timeout.as_deref()),
-            DEFAULT_STOP_TIMEOUT,
-        ),
-        configured_duration(
-            stop.and_then(|stop| stop.grace.as_deref()),
-            DEFAULT_STOP_GRACE,
-        ),
-    )
+    let mut read = |setting: &str, value: Option<&str>, default: Duration| {
+        value.map_or(default, |value| {
+            parse_duration(value).unwrap_or_else(|_| {
+                unreadable(setting, value);
+                default
+            })
+        })
+    };
+    let timeout = read(
+        "stop.timeout",
+        stop.and_then(|stop| stop.timeout.as_deref()),
+        DEFAULT_STOP_TIMEOUT,
+    );
+    let grace = read(
+        "stop.grace",
+        stop.and_then(|stop| stop.grace.as_deref()),
+        DEFAULT_STOP_GRACE,
+    );
+    (timeout, grace)
 }
 
 /// A configured duration, or the default when it is absent or unreadable. Unreadable
@@ -2926,19 +2947,15 @@ pub async fn stop_sequence(
     let requested = std::time::Instant::now();
     let started = process.started();
     let pid = process.pid();
-    let stop = ctx.config.stop.as_ref();
-    let timeout = phase_duration(
-        ctx,
-        "stop.timeout",
-        stop.and_then(|stop| stop.timeout.as_deref()),
-        DEFAULT_STOP_TIMEOUT,
-    );
-    let grace = phase_duration(
-        ctx,
-        "stop.grace",
-        stop.and_then(|stop| stop.grace.as_deref()),
-        DEFAULT_STOP_GRACE,
-    );
+    let (timeout, grace) = stop_timings(ctx.config, |setting, value| {
+        tracing::warn!(
+            app = %ctx.app,
+            instance = %ctx.instance,
+            setting = %setting,
+            value = %value,
+            "stop timing not understood, using the default"
+        );
+    });
     // The runtime is going away itself: an upgrade or a host reboot must not wait out a
     // CI drain, so the app gets the signal and a short fixed grace, and its stop command
     // never runs. An app whose work must outlive the runtime declares service mode.
@@ -2981,9 +2998,11 @@ pub async fn stop_sequence(
     // whatever the command left of it is the app's to finish its work in once asked,
     // and never less than the grace.
     let wait = window.saturating_sub(requested.elapsed()).max(grace);
+    // A stop command that ran was the ask, whatever the platform can signal after it.
+    let command_asked = stop_status != StopStatus::Skipped;
     let (how, status) = match early_exit {
         Some(result) => (StopHow::Graceful, result.ok()),
-        None => end_the_app(ctx, process, signal, wait, force).await,
+        None => end_the_app(ctx, process, signal, (wait, grace), command_asked, force).await,
     };
 
     let run_duration = started.elapsed();
@@ -2999,13 +3018,18 @@ pub async fn stop_sequence(
     }
 }
 
-/// Asks the app to end, waits up to `wait` for it to, and kills it if that runs out — or
-/// kills it straight away when the caller has stopped waiting.
+/// Asks the app to end, waits for it to, and kills it if that runs out — or kills it
+/// straight away when the caller has stopped waiting.
+///
+/// `(wait, grace)`: an app that was asked — signalled, stopped through its manager, or
+/// already sent its stop command — has `wait` to finish its work; one nothing could ask
+/// has no work it was told to finish, and gets only its `grace`.
 async fn end_the_app(
     ctx: &AppContext<'_>,
     process: &mut AppProcess<'_>,
     signal: StopSignal,
-    wait: Duration,
+    (wait, grace): (Duration, Duration),
+    command_asked: bool,
     force: &CancellationToken,
 ) -> (StopHow, Option<ExitStatus>) {
     if force.is_cancelled() {
@@ -3015,7 +3039,9 @@ async fn end_the_app(
     // A Unix child gets the signal it declared; a service gets its manager's stop. On
     // Windows a child gets nothing to act on — there the stop command was the whole
     // ask, and the wait is the app's chance to finish acting on it.
-    match process.signal(signal).await {
+    let ask = process.signal(signal).await;
+    let wait = wait_after_ask(ask, command_asked, wait, grace);
+    match ask {
         StopAsk::Signal(signal) => tracing::info!(
             app = %ctx.app,
             instance = %ctx.instance,
@@ -3058,6 +3084,17 @@ async fn end_the_app(
     };
     process.kill().await;
     (how, process.wait().await.ok())
+}
+
+/// How long an app has to end once the runtime has done what it can to ask: `wait` when
+/// something asked it — its signal, its manager's stop, or a stop command that ran —
+/// and only `grace` when nothing could.
+fn wait_after_ask(ask: StopAsk, command_asked: bool, wait: Duration, grace: Duration) -> Duration {
+    if matches!(ask, StopAsk::None) && !command_asked {
+        grace
+    } else {
+        wait
+    }
 }
 
 /// The one line an operator reads when an app is gone.
@@ -4724,6 +4761,20 @@ mod tests {
                 "{rejected:?} must be rejected"
             );
         }
+    }
+
+    /// An app that was asked keeps its whole wait; one nothing could ask — no signal it
+    /// can receive, no stop command that ran — has only its grace.
+    #[test]
+    fn only_an_app_that_was_asked_waits_out_its_stop_timeout() {
+        let (wait, grace) = (Duration::from_secs(3600), Duration::from_secs(10));
+        assert_eq!(
+            wait_after_ask(StopAsk::Signal(StopSignal::Int), false, wait, grace),
+            wait
+        );
+        assert_eq!(wait_after_ask(StopAsk::Manager, false, wait, grace), wait);
+        assert_eq!(wait_after_ask(StopAsk::None, true, wait, grace), wait);
+        assert_eq!(wait_after_ask(StopAsk::None, false, wait, grace), grace);
     }
 
     /// The maximum duration a caller should budget for stopping this app.
