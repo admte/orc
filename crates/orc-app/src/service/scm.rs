@@ -238,12 +238,11 @@ impl ServiceBackend for Scm {
             let _ = control.stop();
         }
         let service = open(name, ServiceAccess::QUERY_STATUS)?;
-        let pid = service
-            .query_status()
-            .ok()
-            .and_then(|status| status.process_id)
-            .filter(|pid| *pid > 0);
-        let Some(pid) = pid else {
+        // Read here rather than through `query_status`, which reports a process only
+        // while the service is running: a kill comes after the stop was asked, when
+        // the service is stopping, and would otherwise find nothing to end.
+        let Some(pid) = process_id(&service) else {
+            tracing::debug!(service = %name, "service has no process left to kill");
             return Ok(());
         };
         // Windows has no process group to signal, so the tree is ended through
@@ -323,6 +322,34 @@ impl ServiceBackend for Scm {
             },
         )))
     }
+}
+
+/// The process the SCM runs the service in, whatever state the service is in; `None`
+/// once it has none.
+#[allow(
+    unsafe_code,
+    reason = "the SCM has no safe query for a stopping service's process"
+)]
+fn process_id(service: &Service) -> Option<u32> {
+    use windows_sys::Win32::System::Services::{
+        QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+    };
+
+    // SAFETY: zero is a valid SERVICE_STATUS_PROCESS (plain integers).
+    let mut status: SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
+    let mut needed = 0_u32;
+    // SAFETY: `status` is a writable SERVICE_STATUS_PROCESS of exactly the size passed,
+    // and the handle stays open for the call.
+    let ok = unsafe {
+        QueryServiceStatusEx(
+            service.raw_handle(),
+            SC_STATUS_PROCESS_INFO,
+            std::ptr::addr_of_mut!(status).cast(),
+            u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>()).ok()?,
+            std::ptr::addr_of_mut!(needed),
+        )
+    };
+    (ok != 0 && status.dwProcessId != 0).then_some(status.dwProcessId)
 }
 
 fn is_running(service: &Service) -> bool {
