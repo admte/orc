@@ -85,6 +85,8 @@ impl PackageOptions {
 
 const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const ANNOTATIONS_FILE: &str = "annotations.json";
+/// The `x-source` kind that carries the pool's mode: a boolean with no source params.
+const POOL_ON_DEMAND_KIND: &str = "pool.on_demand";
 const ENDPOINT_PROTOCOLS: &[&str] = &["tcp", "udp", "http", "https"];
 /// Serve modes an endpoint may declare (spec 180). `role` is reserved for a later
 /// field and is not accepted: refusing it now keeps its meaning open, where accepting
@@ -935,6 +937,20 @@ fn validate_params(
                     }
                 }
             }
+            if kind == POOL_ON_DEMAND_KIND {
+                // The host fills it from the pool's mode, `true` when the pool starts nodes
+                // on demand: a flag, configured by nothing but the pool itself.
+                if property.get("type").and_then(Value::as_str) != Some("boolean") {
+                    return Err(CliError::Usage(format!(
+                        "params property {name:?} x-source kind {kind:?} must be type \"boolean\""
+                    )));
+                }
+                if x_source.contains_key("params") {
+                    return Err(CliError::Usage(format!(
+                        "params property {name:?} x-source kind {kind:?} takes no x-source.params"
+                    )));
+                }
+            }
             if let Some(params) = x_source.get("params") {
                 let params = params.as_object().ok_or_else(|| {
                     CliError::Usage(format!(
@@ -1327,6 +1343,46 @@ mod tests {
         )
         .expect("config");
         plan_directory_push(dir.path()).expect("valid x-source");
+    }
+
+    #[test]
+    fn params_schema_accepts_a_boolean_pool_on_demand_param() {
+        let config = r#"{"params":{"type":"object","properties":{"ephemeral":{"type":"boolean","default":false,"x-source":{"kind":"pool.on_demand"}}}}}"#;
+        validate_app_config(config.as_bytes()).expect("boolean pool.on_demand param");
+    }
+
+    #[test]
+    fn params_schema_rejects_a_malformed_pool_on_demand_param() {
+        let cases = [
+            (
+                "a string",
+                r#"{"params":{"type":"object","properties":{"ephemeral":{"type":"string","x-source":{"kind":"pool.on_demand"}}}}}"#,
+                r#"params property "ephemeral" x-source kind "pool.on_demand" must be type "boolean""#,
+            ),
+            (
+                "an integer",
+                r#"{"params":{"type":"object","properties":{"ephemeral":{"type":"integer","x-source":{"kind":"pool.on_demand"}}}}}"#,
+                r#"must be type "boolean""#,
+            ),
+            (
+                "source params",
+                r#"{"params":{"type":"object","properties":{"ephemeral":{"type":"boolean","x-source":{"kind":"pool.on_demand","params":{"pool":"ci"}}}}}}"#,
+                r#"params property "ephemeral" x-source kind "pool.on_demand" takes no x-source.params"#,
+            ),
+            (
+                "empty source params",
+                r#"{"params":{"type":"object","properties":{"ephemeral":{"type":"boolean","x-source":{"kind":"pool.on_demand","params":{}}}}}}"#,
+                "takes no x-source.params",
+            ),
+        ];
+        for (case, config, expected) in cases {
+            let err = validate_app_config(config.as_bytes()).expect_err(case);
+            let message = err.to_string();
+            assert!(
+                message.contains(expected),
+                "{case}: expected {expected:?} in {message:?}"
+            );
+        }
     }
 
     #[test]

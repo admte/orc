@@ -43,6 +43,10 @@ pub const SOURCE_KINDS: &[SourceKind] = &[
         sensitive: false,
     },
     SourceKind {
+        name: "pool.on_demand",
+        sensitive: false,
+    },
+    SourceKind {
         name: "ca.bundle",
         sensitive: false,
     },
