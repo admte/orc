@@ -289,6 +289,121 @@ fn build_still_refuses_a_malformed_x_source() {
     }
 }
 
+const SETTINGS_RECIPE: &str = r#"
+artifactType: application/vnd.orc8r.app.v2
+annotations:
+  org.opencontainers.image.title: runner
+config:
+  params:
+    type: object
+    properties:
+      url:
+        type: string
+      token:
+        type: string
+        sensitive: true
+      job:
+        type: string
+        sensitive: true
+        x-source:
+          kind: gitlab.job
+          params:
+            url: url
+            token: token
+          settings:
+            version: 19.6.0
+            revision: 9e4c6b50
+            features: '{"variables":true,"image":false}'
+files:
+  - README.md
+"#;
+
+#[test]
+fn build_packages_x_source_settings_unchanged() {
+    let package = tempfile::tempdir().expect("package");
+    let cache = tempfile::tempdir().expect("cache");
+    std::fs::write(package.path().join("README.md"), "hello\n").expect("payload");
+    std::fs::write(package.path().join("artifact.yaml"), SETTINGS_RECIPE).expect("recipe");
+
+    let output = run_orc(
+        &cache,
+        &[
+            "build",
+            package.path().to_str().expect("package"),
+            "-t",
+            "localhost:5000/acme/runner:1.0",
+        ],
+    );
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("warning"), "{stderr}");
+
+    let digest = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let hex = digest.strip_prefix("sha256:").expect("sha256 digest");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(cache.path().join("manifests/sha256").join(hex)).expect("manifest"),
+    )
+    .expect("manifest json");
+    let config_digest = manifest["config"]["digest"]
+        .as_str()
+        .expect("config digest");
+    let config: serde_json::Value =
+        serde_json::from_slice(&read_blob(cache.path(), config_digest)).expect("config json");
+    assert_eq!(
+        config["params"]["properties"]["job"]["x-source"],
+        json!({
+            "kind": "gitlab.job",
+            "params": {"url": "url", "token": "token"},
+            "settings": {
+                "version": "19.6.0",
+                "revision": "9e4c6b50",
+                "features": r#"{"variables":true,"image":false}"#
+            }
+        })
+    );
+}
+
+#[test]
+fn build_refuses_malformed_x_source_settings() {
+    for (case, settings, expected) in [
+        (
+            "a setting the kind does not define",
+            "settings:\n            colour: red",
+            r#"x-source kind "gitlab.job" defines no setting "colour""#,
+        ),
+        (
+            "a non-string setting",
+            "settings:\n            version: 19",
+            r#"x-source.settings."version" must be a string"#,
+        ),
+        (
+            "settings that are not an object",
+            "settings: 19.6.0",
+            "x-source.settings must be an object of strings",
+        ),
+    ] {
+        let package = tempfile::tempdir().expect("package");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(package.path().join("README.md"), "hello\n").expect("payload");
+        let recipe = SETTINGS_RECIPE.replace(
+            "settings:\n            version: 19.6.0\n            revision: 9e4c6b50\n            \
+             features: '{\"variables\":true,\"image\":false}'",
+            settings,
+        );
+        assert_ne!(recipe, SETTINGS_RECIPE, "{case}");
+        std::fs::write(package.path().join("artifact.yaml"), recipe).expect("recipe");
+
+        let output = run_orc(
+            &cache,
+            &["build", package.path().to_str().expect("package")],
+        );
+        assert!(!output.status.success(), "{case}: build should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{case}: {stderr}");
+        assert_eq!(count_files(cache.path().join("refs")), 0, "{case}");
+    }
+}
+
 fn run_orc(cache: &tempfile::TempDir, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_orc"))
         .args(args)

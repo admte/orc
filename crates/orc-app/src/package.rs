@@ -912,7 +912,7 @@ fn validate_params(
                     "params property {name:?} x-source must be an object"
                 ))
             })?;
-            let allowed_x_source = BTreeSet::from(["kind", "params"]);
+            let allowed_x_source = BTreeSet::from(["kind", "params", "settings"]);
             for key in x_source.keys() {
                 if !allowed_x_source.contains(key.as_str()) {
                     return Err(CliError::Usage(format!(
@@ -965,6 +965,35 @@ fn validate_params(
                     }
                 }
             }
+            validate_x_source_settings(name, kind, x_source.get("settings"))?;
+        }
+    }
+    Ok(())
+}
+
+/// `x-source.settings`: string values the author fixes for the kind (spec 142), each under
+/// a key the kind defines; a kind that defines none takes none. A kind this build does not
+/// know is held to the shape alone: the server it is published to knows its keys.
+fn validate_x_source_settings(name: &str, kind: &str, settings: Option<&Value>) -> Result<()> {
+    let Some(settings) = settings.filter(|settings| !settings.is_null()) else {
+        return Ok(());
+    };
+    let settings = settings.as_object().ok_or_else(|| {
+        CliError::Usage(format!(
+            "params property {name:?} x-source.settings must be an object of strings"
+        ))
+    })?;
+    let defined = crate::params::source_kind(kind).map(|entry| entry.settings);
+    for (key, value) in settings {
+        if defined.is_some_and(|defined| !defined.contains(&key.as_str())) {
+            return Err(CliError::Usage(format!(
+                "params property {name:?} x-source kind {kind:?} defines no setting {key:?}"
+            )));
+        }
+        if !value.is_string() {
+            return Err(CliError::Usage(format!(
+                "params property {name:?} x-source.settings.{key:?} must be a string"
+            )));
         }
     }
     Ok(())
@@ -1871,6 +1900,105 @@ mod tests {
             ]
         );
         assert_eq!(plan.config_bytes, UNKNOWN_KIND_CONFIG.as_bytes());
+    }
+
+    /// A config whose only param `job` has the x-source `source`.
+    fn sourced_config(source: &str) -> String {
+        format!(
+            r#"{{"params":{{"type":"object","properties":{{"job":{{"type":"string","sensitive":true,"x-source":{source}}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn x_source_settings_the_kind_defines_are_accepted_and_packaged_verbatim() {
+        let source = r#"{"kind":"gitlab.job","params":{"url":"url","token":"token","ca":"ca"},"settings":{"version":"19.6.0","revision":"9e4c6b50","features":"{\"variables\":true,\"image\":false}"}}"#;
+        let config = sourced_config(source);
+        let warnings = check_app_config(config.as_bytes(), UnknownSourceKinds::Refuse)
+            .expect("gitlab.job settings");
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("app.config.v1.json"), &config).expect("config");
+        let plan = plan_directory_push(dir.path()).expect("plan");
+        assert_eq!(plan.config_bytes, config.as_bytes());
+        let packaged: Value = serde_json::from_slice(&plan.config_bytes).expect("config blob");
+        let expected: Value = serde_json::from_str(source).expect("source");
+        assert_eq!(
+            packaged["params"]["properties"]["job"]["x-source"]["settings"],
+            expected["settings"]
+        );
+
+        // No settings, an empty object and null each give none, for any kind.
+        for source in [
+            r#"{"kind":"gitlab.job","settings":{}}"#,
+            r#"{"kind":"gitlab.job","settings":null}"#,
+            r#"{"kind":"gitlab.job","settings":{"version":"19.6.0"}}"#,
+            r#"{"kind":"github.runner","settings":{}}"#,
+            r#"{"kind":"pool.name","settings":null}"#,
+        ] {
+            validate_app_config(sourced_config(source).as_bytes())
+                .unwrap_or_else(|err| panic!("{source}: {err}"));
+        }
+    }
+
+    #[test]
+    fn malformed_x_source_settings_are_refused() {
+        let cases = [
+            (
+                r#"{"kind":"gitlab.job","settings":{"colour":"red"}}"#,
+                r#"params property "job" x-source kind "gitlab.job" defines no setting "colour""#,
+            ),
+            (
+                r#"{"kind":"gitlab.job","settings":{"version":19}}"#,
+                r#"params property "job" x-source.settings."version" must be a string"#,
+            ),
+            (
+                r#"{"kind":"gitlab.job","settings":{"features":{"variables":true}}}"#,
+                r#"x-source.settings."features" must be a string"#,
+            ),
+            (
+                r#"{"kind":"gitlab.job","settings":"19.6.0"}"#,
+                r#"params property "job" x-source.settings must be an object of strings"#,
+            ),
+            (
+                r#"{"kind":"gitlab.job","settings":["version"]}"#,
+                "x-source.settings must be an object of strings",
+            ),
+            // A kind that defines no settings takes none.
+            (
+                r#"{"kind":"github.runner","settings":{"version":"1"}}"#,
+                r#"x-source kind "github.runner" defines no setting "version""#,
+            ),
+            (
+                r#"{"kind":"pool.name","settings":{"version":"1"}}"#,
+                r#"x-source kind "pool.name" defines no setting "version""#,
+            ),
+        ];
+        for (source, expected) in cases {
+            let config = sourced_config(source);
+            for policy in [UnknownSourceKinds::Refuse, UnknownSourceKinds::Warn] {
+                let err =
+                    check_app_config(config.as_bytes(), policy).expect_err("malformed settings");
+                assert!(err.to_string().contains(expected), "{source}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_is_held_to_the_settings_shape_alone() {
+        let config = sourced_config(r#"{"kind":"some.future","settings":{"anything":"1"}}"#);
+        let warnings = check_app_config(config.as_bytes(), UnknownSourceKinds::Warn)
+            .expect("the server knows its keys");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        let config = sourced_config(r#"{"kind":"some.future","settings":{"anything":1}}"#);
+        let err = check_app_config(config.as_bytes(), UnknownSourceKinds::Warn)
+            .expect_err("not a string");
+        assert!(
+            err.to_string()
+                .contains(r#"x-source.settings."anything" must be a string"#),
+            "{err}"
+        );
     }
 
     #[test]

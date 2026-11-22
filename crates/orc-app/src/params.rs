@@ -14,6 +14,9 @@ pub struct SourceKind {
     /// format v2 param it fills must be marked `sensitive` (spec 214 *Publish checks*):
     /// the catalog guards what the manifest decides, and never decides it itself.
     pub sensitive: bool,
+    /// The keys the kind's `x-source.settings` may give: string values the author fixes
+    /// for the kind, which the host uses as given (spec 142). Most kinds define none.
+    pub settings: &'static [&'static str],
 }
 
 /// The `x-source` kinds this build of orc knows (spec 142 *Orchestrator-Sourced Values*).
@@ -21,46 +24,62 @@ pub const SOURCE_KINDS: &[SourceKind] = &[
     SourceKind {
         name: "peers.gossip",
         sensitive: false,
+        settings: &[],
     },
     SourceKind {
         name: "peers.all",
         sensitive: false,
+        settings: &[],
     },
     SourceKind {
         name: "peers.first",
         sensitive: false,
+        settings: &[],
     },
     SourceKind {
         name: "peers.any",
         sensitive: false,
+        settings: &[],
     },
     SourceKind {
         name: "pool.slot",
         sensitive: false,
+        settings: &[],
     },
     SourceKind {
         name: "pool.name",
         sensitive: false,
+        settings: &[],
     },
     SourceKind {
         name: "pool.on_demand",
         sensitive: false,
+        settings: &[],
     },
     SourceKind {
         name: "ca.bundle",
         sensitive: false,
+        settings: &[],
     },
     SourceKind {
         name: "tls.cert",
         sensitive: false,
+        settings: &[],
     },
     SourceKind {
         name: "tls.key",
         sensitive: true,
+        settings: &[],
     },
     SourceKind {
         name: "github.runner",
         sensitive: true,
+        settings: &[],
+    },
+    SourceKind {
+        name: "gitlab.job",
+        sensitive: true,
+        settings: &["version", "revision", "features"],
     },
 ];
 
