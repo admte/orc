@@ -1902,19 +1902,19 @@ mod tests {
         assert_eq!(plan.config_bytes, UNKNOWN_KIND_CONFIG.as_bytes());
     }
 
-    /// A config whose only param `job` has the x-source `source`.
+    /// A config whose only param `token` has the x-source `source`.
     fn sourced_config(source: &str) -> String {
         format!(
-            r#"{{"params":{{"type":"object","properties":{{"job":{{"type":"string","sensitive":true,"x-source":{source}}}}}}}}}"#
+            r#"{{"params":{{"type":"object","properties":{{"token":{{"type":"string","sensitive":true,"x-source":{source}}}}}}}}}"#
         )
     }
 
     #[test]
     fn x_source_settings_the_kind_defines_are_accepted_and_packaged_verbatim() {
-        let source = r#"{"kind":"gitlab.job","params":{"url":"url","token":"token","ca":"ca"},"settings":{"version":"19.6.0","revision":"9e4c6b50","features":"{\"variables\":true,\"image\":false}"}}"#;
+        let source = r#"{"kind":"gitlab.runner","params":{"url":"url"},"settings":{"version":"19.6.0","revision":"9e4c6b50","features":"{\"variables\":true,\"image\":false}"}}"#;
         let config = sourced_config(source);
         let warnings = check_app_config(config.as_bytes(), UnknownSourceKinds::Refuse)
-            .expect("gitlab.job settings");
+            .expect("gitlab.runner settings");
         assert!(warnings.is_empty(), "{warnings:?}");
 
         let dir = tempfile::tempdir().expect("dir");
@@ -1924,15 +1924,15 @@ mod tests {
         let packaged: Value = serde_json::from_slice(&plan.config_bytes).expect("config blob");
         let expected: Value = serde_json::from_str(source).expect("source");
         assert_eq!(
-            packaged["params"]["properties"]["job"]["x-source"]["settings"],
+            packaged["params"]["properties"]["token"]["x-source"]["settings"],
             expected["settings"]
         );
 
         // No settings, an empty object and null each give none, for any kind.
         for source in [
-            r#"{"kind":"gitlab.job","settings":{}}"#,
-            r#"{"kind":"gitlab.job","settings":null}"#,
-            r#"{"kind":"gitlab.job","settings":{"version":"19.6.0"}}"#,
+            r#"{"kind":"gitlab.runner","settings":{}}"#,
+            r#"{"kind":"gitlab.runner","settings":null}"#,
+            r#"{"kind":"gitlab.runner","settings":{"version":"19.6.0"}}"#,
             r#"{"kind":"github.runner","settings":{}}"#,
             r#"{"kind":"pool.name","settings":null}"#,
         ] {
@@ -1941,27 +1941,47 @@ mod tests {
         }
     }
 
+    /// A kind no release ever shipped is unknown like any other: refused by default, named
+    /// in a warning where unknown kinds are let through.
+    #[test]
+    fn the_replaced_gitlab_job_kind_is_an_unknown_kind() {
+        assert!(!is_known_source_kind("gitlab.job"));
+        let config = sourced_config(r#"{"kind":"gitlab.job","params":{"url":"url"}}"#);
+        let err = validate_app_config(config.as_bytes()).expect_err("unknown kind");
+        assert!(
+            err.to_string()
+                .contains(r#"params property "token" x-source kind "gitlab.job" is not supported"#),
+            "{err}"
+        );
+        let warnings = check_app_config(config.as_bytes(), UnknownSourceKinds::Warn)
+            .expect("unknown kinds are let through");
+        assert_eq!(
+            warnings,
+            [unknown_source_kind_warning("token", "gitlab.job")]
+        );
+    }
+
     #[test]
     fn malformed_x_source_settings_are_refused() {
         let cases = [
             (
-                r#"{"kind":"gitlab.job","settings":{"colour":"red"}}"#,
-                r#"params property "job" x-source kind "gitlab.job" defines no setting "colour""#,
+                r#"{"kind":"gitlab.runner","settings":{"colour":"red"}}"#,
+                r#"params property "token" x-source kind "gitlab.runner" defines no setting "colour""#,
             ),
             (
-                r#"{"kind":"gitlab.job","settings":{"version":19}}"#,
-                r#"params property "job" x-source.settings."version" must be a string"#,
+                r#"{"kind":"gitlab.runner","settings":{"version":19}}"#,
+                r#"params property "token" x-source.settings."version" must be a string"#,
             ),
             (
-                r#"{"kind":"gitlab.job","settings":{"features":{"variables":true}}}"#,
+                r#"{"kind":"gitlab.runner","settings":{"features":{"variables":true}}}"#,
                 r#"x-source.settings."features" must be a string"#,
             ),
             (
-                r#"{"kind":"gitlab.job","settings":"19.6.0"}"#,
-                r#"params property "job" x-source.settings must be an object of strings"#,
+                r#"{"kind":"gitlab.runner","settings":"19.6.0"}"#,
+                r#"params property "token" x-source.settings must be an object of strings"#,
             ),
             (
-                r#"{"kind":"gitlab.job","settings":["version"]}"#,
+                r#"{"kind":"gitlab.runner","settings":["version"]}"#,
                 "x-source.settings must be an object of strings",
             ),
             // A kind that defines no settings takes none.
