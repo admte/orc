@@ -302,14 +302,10 @@ config:
       token:
         type: string
         sensitive: true
-      job:
-        type: string
-        sensitive: true
         x-source:
-          kind: gitlab.job
+          kind: gitlab.runner
           params:
             url: url
-            token: token
           settings:
             version: 19.6.0
             revision: 9e4c6b50
@@ -350,10 +346,10 @@ fn build_packages_x_source_settings_unchanged() {
     let config: serde_json::Value =
         serde_json::from_slice(&read_blob(cache.path(), config_digest)).expect("config json");
     assert_eq!(
-        config["params"]["properties"]["job"]["x-source"],
+        config["params"]["properties"]["token"]["x-source"],
         json!({
-            "kind": "gitlab.job",
-            "params": {"url": "url", "token": "token"},
+            "kind": "gitlab.runner",
+            "params": {"url": "url"},
             "settings": {
                 "version": "19.6.0",
                 "revision": "9e4c6b50",
@@ -369,7 +365,7 @@ fn build_refuses_malformed_x_source_settings() {
         (
             "a setting the kind does not define",
             "settings:\n            colour: red",
-            r#"x-source kind "gitlab.job" defines no setting "colour""#,
+            r#"x-source kind "gitlab.runner" defines no setting "colour""#,
         ),
         (
             "a non-string setting",

@@ -77,7 +77,7 @@ pub const SOURCE_KINDS: &[SourceKind] = &[
         settings: &[],
     },
     SourceKind {
-        name: "gitlab.job",
+        name: "gitlab.runner",
         sensitive: true,
         settings: &["version", "revision", "features"],
     },
@@ -116,7 +116,7 @@ fn is_file_backed(property: &ParamProperty) -> bool {
         || property.x_source.as_ref().is_some_and(|source| {
             matches!(
                 source.kind.as_str(),
-                "tls.key" | "github.runner" | "peers.all"
+                "tls.key" | "github.runner" | "gitlab.runner" | "peers.all"
             )
         })
 }
@@ -177,10 +177,11 @@ pub fn parsed_assignment_params(
                 .and_then(|property| property.x_source.as_ref())
                 .map(|source| source.kind.as_str());
             let tls_key_source = source_kind == Some("tls.key");
-            // A `github.runner` param holds either the operator's own token, tokenized to a
-            // `sec:` reference at configure time, or the credential the host minted for this
+            // A runner-credential param holds either the operator's own token, tokenized to a
+            // `sec:` reference at configure time, or the credential the host issued for this
             // node, which arrives as plain content. Only the former is a reference.
-            let host_minted = source_kind == Some("github.runner") && !value.starts_with("sec:");
+            let host_minted = matches!(source_kind, Some("github.runner" | "gitlab.runner"))
+                && !value.starts_with("sec:");
             let sensitive = property.is_some_and(|property| property.sensitive)
                 || property.is_some_and(is_implicitly_sensitive);
             let file_backed = property.is_some_and(is_file_backed) || sensitive;
@@ -710,34 +711,80 @@ mod tests {
     }
 
     #[test]
-    fn github_runner_param_is_a_reference_only_when_the_operator_set_it() {
-        let schema = schema(
-            r#"{
-            "properties": {
-                "token": {"type": "string", "sensitive": true, "x-source": {"kind": "github.runner", "params": {"url": "url"}}}
-            }
-        }"#,
-        );
-        // The operator's own token was tokenized at configure time: a secret reference.
-        let operator = BTreeMap::from([("token".to_owned(), "sec:pool:p_1:1:s_1".to_owned())]);
-        let parsed = parsed_assignment_params(&operator, Some(&schema));
-        assert_eq!(
-            parsed["token"].value,
-            ParsedParamValue::SecretRef("sec:pool:p_1:1:s_1".to_owned())
-        );
-        assert!(parsed["token"].file_backed);
+    fn a_runner_credential_param_is_a_reference_only_when_the_operator_set_it() {
+        for (kind, issued) in [
+            ("github.runner", r#"{"mode":"persistent","token":"AAA"}"#),
+            (
+                "gitlab.runner",
+                r#"{"mode":"job","url":"https://gitlab.example.com","job":{"id":7}}"#,
+            ),
+        ] {
+            let schema = schema(&format!(
+                r#"{{
+                "properties": {{
+                    "url": {{"type": "string"}},
+                    "token": {{"type": "string", "sensitive": true, "x-source": {{"kind": "{kind}", "params": {{"url": "url"}}}}}}
+                }}
+            }}"#
+            ));
+            // The operator's own token was tokenized at configure time: a secret reference.
+            let operator = BTreeMap::from([("token".to_owned(), "sec:pool:p_1:1:s_1".to_owned())]);
+            let parsed = parsed_assignment_params(&operator, Some(&schema));
+            assert_eq!(
+                parsed["token"].value,
+                ParsedParamValue::SecretRef("sec:pool:p_1:1:s_1".to_owned()),
+                "{kind}"
+            );
+            assert!(parsed["token"].file_backed, "{kind}");
 
-        // The credential the host minted for this node arrives as content, still file-backed.
-        let minted = BTreeMap::from([(
-            "token".to_owned(),
-            r#"{"mode":"persistent","token":"AAA"}"#.to_owned(),
-        )]);
-        let parsed = parsed_assignment_params(&minted, Some(&schema));
-        assert_eq!(
-            parsed["token"].value,
-            ParsedParamValue::String(r#"{"mode":"persistent","token":"AAA"}"#.to_owned())
-        );
-        assert!(parsed["token"].file_backed);
+            // Left blank, the credential the host issued for this node arrives as content,
+            // still file-backed.
+            let minted = BTreeMap::from([("token".to_owned(), issued.to_owned())]);
+            let parsed = parsed_assignment_params(&minted, Some(&schema));
+            assert_eq!(
+                parsed["token"].value,
+                ParsedParamValue::String(issued.to_owned()),
+                "{kind}"
+            );
+            assert!(parsed["token"].file_backed, "{kind}");
+        }
+    }
+
+    /// Both runner kinds are file-backed by format v1's rule without the manifest's word.
+    /// The operator's own token is given as any sensitive value is, as a file or a secret
+    /// reference; left out, the host issues the credential.
+    #[test]
+    fn a_runner_credential_param_is_file_backed_given_or_left_blank() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("token.txt"), b"secret").expect("token");
+        for kind in ["github.runner", "gitlab.runner"] {
+            let schema = schema(&format!(
+                r#"{{"properties": {{"token": {{"type": "string", "x-source": {{"kind": "{kind}", "params": {{"url": "url"}}}}}}}}}}"#
+            ));
+            let file = parse_app_params(
+                Some(&schema),
+                &["--token".to_owned(), "@token.txt".to_owned()],
+                dir.path(),
+            )
+            .expect("file");
+            assert!(file["token"].file_backed, "{kind}");
+            assert!(
+                parse_app_params(
+                    Some(&schema),
+                    &["--token".to_owned(), "hunter2".to_owned()],
+                    dir.path(),
+                )
+                .is_err(),
+                "{kind}"
+            );
+            // Blank: nothing is given, and the host issues the credential.
+            assert!(
+                parse_app_params(Some(&schema), &[], dir.path())
+                    .expect("blank")
+                    .is_empty(),
+                "{kind}"
+            );
+        }
     }
 
     fn schema(body: &str) -> ParamSchema {

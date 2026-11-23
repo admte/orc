@@ -759,7 +759,7 @@ mod tests {
     /// credential must say it is sensitive, and the refusal names the param and the kind.
     #[test]
     fn a_param_from_a_sensitive_kind_must_be_marked_sensitive() {
-        for kind in ["tls.key", "github.runner", "gitlab.job"] {
+        for kind in ["tls.key", "github.runner", "gitlab.runner"] {
             let found = one(serde_json::json!({
                 "params": {"properties": {"secret": {"type": "string", "x-source": {"kind": kind}}}},
                 "install": {"command": ["./run.sh", "--secret=${secret}"]}
@@ -802,7 +802,7 @@ mod tests {
             .filter(|kind| kind.sensitive)
             .map(|kind| kind.name)
             .collect();
-        assert_eq!(sensitive, ["tls.key", "github.runner", "gitlab.job"]);
+        assert_eq!(sensitive, ["tls.key", "github.runner", "gitlab.runner"]);
     }
 
     #[test]
